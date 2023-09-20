@@ -1,5 +1,6 @@
-site_name: My Docs
-
+site_name: Work笔记本
+repo_name: wz1qqx/NoteBook
+repo_url: https://github.com/wz1qqx/NoteBook/
 
 theme: 
   name: 'material'
@@ -38,3 +39,8 @@ markdown_extensions:
       anchor_linenums: true
   - pymdownx.arithmatex:
       generic: true
+
+extra:
+  social:
+    - type: 'github'
+      link: 'https://github.com/wz1qqx'
