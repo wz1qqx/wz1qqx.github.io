@@ -35,9 +35,13 @@ markdown_extensions:
   - pymdownx.magiclink
   - pymdownx.superfences
   - pymdownx.inlinehilite
+  - codehilite:
+      guess_lang: false
+      linenums: false
+  - pymdownx.betterem:
+      smart_enable: all
   - pymdownx.emoji:
-      emoji_index: !!python/name:materialx.emoji.twemoji
-      emoji_generator: !!python/name:materialx.emoji.to_svg
+      emoji_generator: !!python/name:pymdownx.emoji.to_png
   - pymdownx.tabbed:
       alternate_style: true 
   - pymdownx.tasklist:
@@ -47,10 +51,10 @@ markdown_extensions:
   - pymdownx.arithmatex:
       generic: true
 
-extra:
-  social:
-    - type: 'github'
-      link: 'https://github.com/wz1qqx'
+# extra:
+#   social:
+#     - type: 'github'
+#       link: 'https://github.com/wz1qqx'
 
 nav:
   - Home:
