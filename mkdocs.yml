@@ -1,6 +1,13 @@
 site_name: Work笔记本
+site_author: wz1qqx
+site_url: https://wz1qqx.github.io/
+
+# Repository
 repo_name: wz1qqx/wz1qqx.github.io
 repo_url: https://github.com/wz1qqx/wz1qqx.github.io/
+
+# Copyright
+copyright: "Copyright &copy; 2023 - 2023 Zq"
 
 theme: 
   name: 'material'
@@ -44,3 +51,9 @@ extra:
   social:
     - type: 'github'
       link: 'https://github.com/wz1qqx'
+
+nav:
+  - Home:
+    - index.md
+  - ML Framework:
+    - ML FrameWork/xacc.md
