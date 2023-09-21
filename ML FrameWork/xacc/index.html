@@ -1,0 +1,618 @@
+
+<!doctype html>
+<html lang="zh" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+        <meta name="author" content="wz1qqx">
+      
+      
+        <link rel="canonical" href="https://wz1qqx.github.io/ML%20FrameWork/xacc/">
+      
+      
+        <link rel="prev" href="../..">
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.4.2, mkdocs-material-9.0.6">
+    
+    
+      
+        <title>Xacc - Work笔记本</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.558e4712.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.2505c338.min.css">
+      
+      
+
+    
+    
+    
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="" data-md-color-accent="">
+  
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&"object"==typeof palette.color)for(var key of Object.keys(palette.color))document.body.setAttribute("data-md-color-"+key,palette.color[key])</script>
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#python-ai" class="md-skip">
+          跳转至
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="页眉">
+    <a href="../.." title="Work笔记本" class="md-header__button md-logo" aria-label="Work笔记本" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54Z"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Work笔记本
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Xacc
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      <form class="md-header__option" data-md-component="palette">
+        
+          
+          <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="" data-md-color-accent=""  aria-hidden="true"  type="radio" name="__palette" id="__palette_1">
+          
+        
+      </form>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="搜索" placeholder="搜索" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="查找">
+        
+        <button type="reset" class="md-search__icon md-icon" title="清空当前内容" aria-label="清空当前内容" tabindex="-1">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            正在初始化搜索引擎
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/wz1qqx/wz1qqx.github.io/" title="前往仓库" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc.--><path d="M439.55 236.05 244 40.45a28.87 28.87 0 0 0-40.81 0l-40.66 40.63 51.52 51.52c27.06-9.14 52.68 16.77 43.39 43.68l49.66 49.66c34.23-11.8 61.18 31 35.47 56.69-26.49 26.49-70.21-2.87-56-37.34L240.22 199v121.85c25.3 12.54 22.26 41.85 9.08 55a34.34 34.34 0 0 1-48.55 0c-17.57-17.6-11.07-46.91 11.25-56v-123c-20.8-8.51-24.6-30.74-18.64-45L142.57 101 8.45 235.14a28.86 28.86 0 0 0 0 40.81l195.61 195.6a28.86 28.86 0 0 0 40.8 0l194.69-194.69a28.86 28.86 0 0 0 0-40.81z"/></svg>
+  </div>
+  <div class="md-source__repository">
+    wz1qqx/wz1qqx.github.io
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--primary" aria-label="导航栏" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Work笔记本" class="md-nav__button md-logo" aria-label="Work笔记本" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54Z"/></svg>
+
+    </a>
+    Work笔记本
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/wz1qqx/wz1qqx.github.io/" title="前往仓库" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc.--><path d="M439.55 236.05 244 40.45a28.87 28.87 0 0 0-40.81 0l-40.66 40.63 51.52 51.52c27.06-9.14 52.68 16.77 43.39 43.68l49.66 49.66c34.23-11.8 61.18 31 35.47 56.69-26.49 26.49-70.21-2.87-56-37.34L240.22 199v121.85c25.3 12.54 22.26 41.85 9.08 55a34.34 34.34 0 0 1-48.55 0c-17.57-17.6-11.07-46.91 11.25-56v-123c-20.8-8.51-24.6-30.74-18.64-45L142.57 101 8.45 235.14a28.86 28.86 0 0 0 0 40.81l195.61 195.6a28.86 28.86 0 0 0 40.8 0l194.69-194.69a28.86 28.86 0 0 0 0-40.81z"/></svg>
+  </div>
+  <div class="md-source__repository">
+    wz1qqx/wz1qqx.github.io
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+      
+
+  
+  
+  
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+      
+      
+      
+      <input class="md-nav__toggle md-toggle " data-md-toggle="__nav_1" type="checkbox" id="__nav_1" >
+      
+      
+      
+        <label class="md-nav__link" for="__nav_1" tabindex="0" aria-expanded="false">
+          Home
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <nav class="md-nav" aria-label="Home" data-md-level="1">
+        <label class="md-nav__title" for="__nav_1">
+          <span class="md-nav__icon md-icon"></span>
+          Home
+        </label>
+        <ul class="md-nav__list" data-md-scrollfix>
+          
+            
+              
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        Welcome to MkDocs
+      </a>
+    </li>
+  
+
+            
+          
+        </ul>
+      </nav>
+    </li>
+  
+
+    
+      
+      
+      
+
+  
+  
+    
+  
+  
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+      
+      
+      
+      
+      <input class="md-nav__toggle md-toggle " data-md-toggle="__nav_2" type="checkbox" id="__nav_2" checked>
+      
+      
+      
+        <label class="md-nav__link" for="__nav_2" tabindex="0" aria-expanded="true">
+          ML Framework
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <nav class="md-nav" aria-label="ML Framework" data-md-level="1">
+        <label class="md-nav__title" for="__nav_2">
+          <span class="md-nav__icon md-icon"></span>
+          ML Framework
+        </label>
+        <ul class="md-nav__list" data-md-scrollfix>
+          
+            
+              
+  
+  
+    
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" data-md-toggle="toc" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        Xacc
+      </a>
+      
+    </li>
+  
+
+            
+          
+        </ul>
+      </nav>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="目录">
+  
+  
+  
+    
+  
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+  
+  
+
+
+
+<div class="toc">
+<ul>
+<li><a href="#python-ai">Python AI编译前端</a></li>
+<li><a href="#_1">背景</a><ul>
+<li><a href="#_2">简介</a></li>
+<li><a href="#ai">AI框架前端技术</a></li>
+<li><a href="#ai_1">AI框架后端技术</a></li>
+<li><a href="#_3">总结</a></li>
+</ul>
+</li>
+<li><a href="#_4">技术方案</a><ul>
+<li><a href="#overview">overview</a></li>
+<li><a href="#_5">标准编译流程</a></li>
+<li><a href="#_6">高级（特色）编译流程</a></li>
+<li><a href="#_7">补充编译流程</a></li>
+<li><a href="#_8">整体流程</a></li>
+<li><a href="#_9">详细设计</a></li>
+</ul>
+</li>
+<li><a href="#_10">参考文献</a></li>
+</ul>
+</div>
+<h1 id="python-ai">Python AI编译前端<a class="headerlink" href="#python-ai" title="Permanent link">&para;</a></h1>
+<p><strong>2022.11.24</strong> XMLIR整体架构与产品暂定名称（与 @许叶华 讨论的初步结构和名称，随时更新）</p>
+<ol>
+<li>xacc：XPU AI Compiler Collection；以XMLIR为编译后端，结合新的编译前端扩展成完整AI编译工具链；</li>
+<li>xacc.jit/xacc.aot: xacc的JIT/AOT API入口；</li>
+<li>xacc.frontend: xacc的编译器前端，主要负责接入API、前端表达（python的bytecode和深度学习框架的接口）的分析、理解和优化；</li>
+<li>xacc.backend：xacc的编译器后端，主要负责执行过程的分析和优化；包括codegen；</li>
+</ol>
+<p><strong>2022.11.23</strong> Bytecode Rewrite与TorchScript讨论</p>
+<ol>
+<li>与 @陈庆澍讨论Bytecode Rewrite在Paddle上应用的可行性，结论是技术可行，但从项目落地角度考虑先focus在PyTorch的支持上；</li>
+<li>与 @许叶华讨论TorchScript模型与Bytecode前端模式的异同：
+   a. TorchScript基于AST变换，不能捕获Python的完整语义；
+   b. TorchScript无法fallback回Python+PyTorch来执行，一旦编译失败就完全无法加速；
+   c. Bytecode编译前端可以更完整捕获语义，即便编译失败也能fallback回Python+PyTorch执行；
+   d. Bytecode编译前端能提供”尽力而为”的加速模式——如果模型中只有50%的部分XPU支持加速，那就让XMLIR加速这50%。而TorchScript模式哪怕模型只有1%的部分XPU不支持加速，就完全不能加速。</li>
+</ol>
+<h1 id="_1">背景<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
+<h2 id="_2">简介<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
+<p><strong>定位</strong>：Python AI编译前端（名字暂定XJIT）是XMLIR编译技术栈的一部分，负责：</p>
+<ol>
+<li>分析客户代码中的计算逻辑，交给XMLIR编译栈进行编译优化；</li>
+<li>更好的兼容PyTorch框架，提供更好的用户体验，提高模型交付速度；</li>
+</ol>
+<p><strong>技术价值</strong></p>
+<ol>
+<li>抓取更为完整的语义，包括分支和循环等逻辑；</li>
+<li>抓取更多高层次信息，比如完整的Layer相关信息，而不是过细粒度的算子信息；</li>
+<li>提供更好的用户使用体验，让用户迁移模型到xpu的过程更为自动化；
+   比如用户想要迁移的某模型代码：</li>
+</ol>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>python model.py
+</code></pre></div>
+<p>借助我们的编译前端，用户只需执行：</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>python -m xjit --device xpu0 model.py
+</code></pre></div>
+<p><strong>产品价值</strong></p>
+<ol>
+<li>
+<p>帮助XMLIR适配更多的用户模型，让XPU获得更大的市场空间；</p>
+</li>
+<li>
+<p>提高XMLIR的交付速度，从客户角度更快落地、成单；</p>
+</li>
+</ol>
+<h2 id="ai">AI框架前端技术<a class="headerlink" href="#ai" title="Permanent link">&para;</a></h2>
+<ol>
+<li>静态图 vs DSL</li>
+</ol>
+<p>a. Caffe：2014-2017，第一代深度学习框架，使用pbtxt语法定义静态计算图图；
+   b. Theano：2007-2017，自动微分+C代码生成，与Caffe同属于第一代框架；
+   c. Torch 7：2002-2018，基于lua语言的科学计算框架，可以支持深度学习；</p>
+<ol start="2">
+<li>静态图+Python DSL</li>
+</ol>
+<p>a. Tensorflow 1.x：2015-2019，第二代深度学习框架，首次基于细粒度算子构建深度学习模型；</p>
+<ol start="3">
+<li>define-by-run</li>
+</ol>
+<p>a. Chainer：2015-2019，日本某公司开发的深度学习框架，首次提出了define-by-run模式；
+   b. Pytorch：2016-今，基于torch的C代码基础库开发的define-by-run模式框架，在学术界非常流行；
+   c. Tensorflow 2.x：2019-今，谷歌迫于PyTorch的竞争，基于eager+动态图执行模型重构了tensorflow；</p>
+<ol start="4">
+<li>函数式编程框架</li>
+</ol>
+<p>a. JAX：2020年左右，谷歌推出的新一代深度学习框架，JAX=AutoGrad+XLA。JAX抛弃了tensorflow中静态图的设计，转而使用Numpy语法，混合AutoGrad进行梯度求导，使用XLA进行编译加速。
+   b. funtorch：2022年PyTorch社区推出的JAX仿制品，意在提供和JAX类似的高阶函数特性；
+   小结：AI框架的前端技术并未像系统同学期望的那样，向静态图架构去演进，倒是反其道而行，专项更贴近Python语法，更贴近用户习惯的方向在演进。</p>
+<h2 id="ai_1">AI框架后端技术<a class="headerlink" href="#ai_1" title="Permanent link">&para;</a></h2>
+<p>与前端技术同步发展的是AI框架的后端技术：</p>
+<ol>
+<li>Layer模块
+   a. caffe
+   b. Theano
+   c. torch 7</li>
+<li>算子+DAG
+   a. tensorflow</li>
+<li>编译优化
+   a. XLA编译优化：tensorflow
+   b. JIT编译
+   i. tf.function
+   ii. torch.jit
+   c. TVM与MLIR
+   i. TVM
+   ii. MLIR</li>
+<li>Python JIT编译优化
+   a. torchdynamo</li>
+</ol>
+<p>小结：后端技术主要趋势是深度异步化和编译技术栈。</p>
+<h2 id="_3">总结<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
+<p>最近谷歌和Facebook在深度学习框架上推出的新技术有两个趋势：</p>
+<ol>
+<li>编译优化是AI框架的发展趋势；</li>
+<li>AI框架前端技术，越来越向Python语法靠近；</li>
+</ol>
+<p>Python前端+MLIR后端是一个比较完备的编译技术栈：</p>
+<ol>
+<li>有技术基础，并且符合未来技术趋势；</li>
+<li>能够帮助芯片类公司扩大市场空间，提高交付速度；</li>
+</ol>
+<h1 id="_4">技术方案<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h1>
+<h2 id="overview">overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p><img alt="图片" src="../xacc.assets/bj-7378718617e4a3747037b3f8732a4201886c41a7-20230914180303023.png" /></p>
+<p>XJIT从字节码捕获用户执行逻辑，并输出包含如下信息的图：</p>
+<ol>
+<li>业务逻辑；</li>
+<li>模型逻辑；</li>
+<li>算子逻辑（算子DAG）；</li>
+</ol>
+<p>对比基于Lazy Tensor的tracing技术，XJIT能够完整捕获分支和循环逻辑，并且将高层信息带给算子图，为XMLIR中的算子图优化带来更多的信息。</p>
+<p>XJIT可以直接输出XGraph IR给XMLIR，或者通过rewrite重写Python Bytecode，再交给Python解释器执行。这样设计有两个好处：</p>
+<ol>
+<li>技术优势：可以对比三条执行路径的结果，方便开发和调试；</li>
+<li>产品优势：可以开放XJIT给目标用户，帮助用户导出graph给到研发来进行评估和调试；</li>
+</ol>
+<h2 id="_5">标准编译流程<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h2>
+<p>标准编译流程是指对输入的Python字节码进行优化，并最终输出优化后字节码、图IR的过程：</p>
+<p><img alt="图片" src="../xacc.assets/bj-8f8a17960d5f1d3ce9243b2f2fc7d3637b9c7aa9-20230914180341319.png" /></p>
+<p>标准编译流程主要由三部分组成：</p>
+<ol>
+<li>
+<p>字节码分析；</p>
+</li>
+<li>
+<p>高层设备无关优化，具体包含如下pass：</p>
+</li>
+</ol>
+<p>a. 死代码消除，用于降低整个计算图的复杂度，便于XMLIR的图编译优化；
+   b. 常量折叠，用于提取不变量，降低XMLIR的图编译复杂度；
+   c. 设备、分布式代码擦除：自动擦除模型代码内的设备绑定代码与分布式训练绑定代码，能够帮助XMLIR更好的适应用户代码；
+   d. 副作用管理：用于管理Python语言的副作用，比如全局变量赋值等；
+   e. 自动设备分配：用于更好的支持大模型和分布式；</p>
+<ol start="3">
+<li>Bytecode/GraphIR Rewriter：根据优化结果自动重写字节码或者图IR；</li>
+</ol>
+<h2 id="_6">高级（特色）编译流程<a class="headerlink" href="#_6" title="Permanent link">&para;</a></h2>
+<p>高级编译流程，是指基于输入的Python字节码，向用户提供如下高阶功能：</p>
+<ol>
+<li>JIT 缓存与AOT编译：XJIT对字节码的编译结果进行缓存，并且通过缓存实现AOT编译；</li>
+<li>PGO编译：Profile Guided Optimization，是指XJIT通过Profile结果指导编译优化的过程；</li>
+<li>自动低精度/混合精度计算：借助PGO机制，在考虑编译速度的同时考虑编译精度；</li>
+</ol>
+<p>一些问题的分析:</p>
+<blockquote>
+<p>Q：为何在XJIT中实现缓存、PGO和低精度等特性？
+A：XJIT与用户执行Python代码的过程耦合，可以较好的与Python的执行流程互动。并且可以通过Bytecode rewrite的机制，向Python解释器注入这些高阶功能需要的代码；</p>
+</blockquote>
+<hr />
+<blockquote>
+<p>Q：这些功能需要添加那些pass？
+A：需要添加一些适配PGO与低精度计算的pass，这些pass向上对接功能特性，向下服务XMLIR编译技术栈；比如：</p>
+<ol>
+<li>低精度相关pass：量化与反量化，剪支操作等；</li>
+<li>pipeline相关优化，比如自动tensor切分和device分配；</li>
+<li>大模块replace操作，比如整体性替换transformer模块、卷积模块；</li>
+</ol>
+</blockquote>
+<h2 id="_7">补充编译流程<a class="headerlink" href="#_7" title="Permanent link">&para;</a></h2>
+<p>补充编译流程用于编译PyTorch模型以外的代码，比较常见的有：</p>
+<ol>
+<li>numpy数值计算代码；</li>
+<li>pandas表格数据计算代码；</li>
+</ol>
+<p>XJIT可以通过Bytecode rewrite技术，将这些计算也抽象成XMLIR的计算图表达，从而实现对整体数据流的加速。而训练数据流本身作为训练框架的一部分，对于训练速度和训练效果都有着至关重要的影响。</p>
+<h2 id="_8">整体流程<a class="headerlink" href="#_8" title="Permanent link">&para;</a></h2>
+<p>XJIT整体分为两大部分：</p>
+<ol>
+<li>语言基础设施：负责与Python语言的交互：</li>
+</ol>
+<p>a. Interpreter Hook：注入到Python解释器中，截获Python执行流；
+   b. Compiler Hook：在Interpreter Hook中，回调JIT编译器完成编译；
+   c. Cache &amp; AOT：缓存编译结果，或者通过编译实现AOT；</p>
+<ol start="2">
+<li>JIT编译器：</li>
+</ol>
+<p>a. Compiler Function：JIT编译器的驱动函数，驱动整个编译流程执行；
+   b. Bytecode Analyzer：分析Python字节码，并联合High-Level Optimization Passes执行优化；
+   c. Pass Manager：用于管理Bytecode Analyzer中的优化pass；
+   d. Bytecide Rewriter：将优化后的程序重新生成执行代码，支持XMLIR后端和其他后端（其他后端用于调试目的）；
+   e. Backend Driver：用于Bytecide Rewriter中驱动编译后端执行优化；
+   f. Generated Backend Bytecode：由Bytecode Rewriter输出的Python字节码，会再交给Interpreter Hook注入给Python Interpreter来执行；
+   g. XMLIR/PyTorch Backend：用于执行计算DAG，XMLIR使用自己的execution engine，PyTorch使用PyTorch自身；</p>
+<h2 id="_9">详细设计<a class="headerlink" href="#_9" title="Permanent link">&para;</a></h2>
+<h1 id="_10">参考文献<a class="headerlink" href="#_10" title="Permanent link">&para;</a></h1>
+<ol>
+<li>Google JAX <a href="https://en.wikipedia.org/wiki/Google_JAX">https://en.wikipedia.org/wiki/Google_JAX</a></li>
+<li>关于深度学习框架的比较 <a href="https://en.wikipedia.org/wiki/Comparison_of_deep_learning_software">https://en.wikipedia.org/wiki/Comparison_of_deep_learning_software</a></li>
+</ol>
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2023 - 2023 Zq
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    <script id="__config" type="application/json">{"base": "../..", "features": [], "search": "../../assets/javascripts/workers/search.e5c33ebb.min.js", "translations": {"clipboard.copied": "\u5df2\u590d\u5236", "clipboard.copy": "\u590d\u5236", "search.result.more.one": "\u5728\u8be5\u9875\u4e0a\u8fd8\u6709 1 \u4e2a\u7b26\u5408\u6761\u4ef6\u7684\u7ed3\u679c", "search.result.more.other": "\u5728\u8be5\u9875\u4e0a\u8fd8\u6709 # \u4e2a\u7b26\u5408\u6761\u4ef6\u7684\u7ed3\u679c", "search.result.none": "\u6ca1\u6709\u627e\u5230\u7b26\u5408\u6761\u4ef6\u7684\u7ed3\u679c", "search.result.one": "\u627e\u5230 1 \u4e2a\u7b26\u5408\u6761\u4ef6\u7684\u7ed3\u679c", "search.result.other": "# \u4e2a\u7b26\u5408\u6761\u4ef6\u7684\u7ed3\u679c", "search.result.placeholder": "\u952e\u5165\u4ee5\u5f00\u59cb\u641c\u7d22", "search.result.term.missing": "\u7f3a\u5c11", "select.version": "\u9009\u62e9\u5f53\u524d\u7248\u672c"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.51d95adb.min.js"></script>
+      
+    
+  </body>
+</html>
