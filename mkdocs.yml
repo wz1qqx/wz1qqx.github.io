@@ -61,3 +61,5 @@ nav:
     - index.md
   - ML Framework:
     - ML FrameWork/xacc.md
+  - vLLM CodePath:
+    - codepath/index.html
