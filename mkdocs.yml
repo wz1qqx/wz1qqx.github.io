@@ -61,5 +61,7 @@ nav:
     - index.md
   - ML Framework:
     - ML FrameWork/xacc.md
-  - vLLM CodePath:
-    - codepath/index.html
+  - vLLM 性能优化:
+    - 总览: codepath/overview.html
+    - CodePath 地图: codepath/index.html
+    - 跨模型对比: codepath/compare.html
