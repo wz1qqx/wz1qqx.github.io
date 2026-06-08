@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM Humming kernel 集成学习笔记</title>
+<style>
+body{font:14px/1.65 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1120px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+h1,h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em}
+h2{margin-top:2rem}
+h3{margin-top:1.4rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;overflow:auto}
+pre code{background:transparent;padding:0}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.lead{color:#57606a;font-size:15px}
+.meta{color:#57606a;font-size:12px}
+.ok{color:#0a7d20;font-weight:600}
+.warn{color:#b35900;font-weight:600}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da}
+.box{border-left:4px solid #0969da;background:#f6f8fa;padding:8px 12px;margin:12px 0}
+nav a{margin-right:1rem}
+</style>
+</head>
+<body>
+<nav><a href="overview.html">&larr; overview</a><a href="index.html">codepath map</a><a href="compare.html">cross-model compare</a></nav>
+
+<h1>vLLM Humming kernel 集成学习笔记</h1>
+<p class="lead">结论先行:Humming 在当前 vLLM 工作树里是一个外部 <code>humming</code> Python 包提供的混合精度 GEMM / MoE expert 计算后端。vLLM 本仓库负责注册、选择、权重格式转换、workspace / routing / All2All 编排,真正的算子入口是外部包的 <code>humming.layer.HummingMethod.forward_layer()</code>。</p>
+<p class="meta">源码基准:<code>/Users/f/Documents/vllm-workspace/tasks/opt-kimi-pd/vllm-int</code> 当前工作树。本文只依据本地源码行号,不推断外部 <code>humming</code> 包内部 kernel 名称。</p>
+
+<h2>一句话定位</h2>
+<table>
+<thead><tr><th>问题</th><th>源码事实</th></tr></thead>
+<tbody>
+<tr><td>humming kernel 是什么</td><td>vLLM 中名为 <code>humming</code> 的 quantization / MoE backend。它把 Linear 或 MoE 的权重转成 Humming 标准格式,再调用外部 <code>HummingMethod.forward_layer()</code> 做 dense GEMM 或 routed MoE 的 <code>w13</code>/<code>w2</code> expert GEMM。</td></tr>
+<tr><td>对应实现文件</td><td>主要适配层:<code>vllm/model_executor/layers/quantization/humming.py</code>; MoE expert 实现:<code>vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py</code>; GPT-OSS/MXFP4 backend 选择:<code>vllm/model_executor/layers/fused_moe/oracle/mxfp4.py</code>; 权重转换工具:<code>vllm/model_executor/layers/quantization/utils/humming_utils.py</code>。</td></tr>
+<tr><td>在推理流程的位置</td><td><span class="tag">MoE FFN / expert GEMM</span>, 位于 transformer layer 的 MoE MLP 分支。它不属于 attention、KV cache、sampling; prefill 和 decode 都会在执行 MoE 层 forward 时经过同一套 expert compute 路径。</td></tr>
+<tr><td>是否默认启用</td><td>不是 MXFP4 auto priority 的默认候选之一。<code>--moe-backend humming</code> 显式映射到 <code>Mxfp4MoeBackend.HUMMING</code>; <code>--quantization humming</code> 显式让 quantization override 选择 <code>HummingConfig</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>源码入口和真实名称</h2>
+<p>代码里存在 <code>humming</code> 字面名,因此不需要另找别名。vLLM 对它的真实命名是:</p>
+<ul>
+  <li>quantization method: <code>HummingConfig.get_name()</code> 返回 <code>"humming"</code>, 见 <code>vllm/model_executor/layers/quantization/humming.py:185-194</code>。</li>
+  <li>MoE backend: <code>MoEBackend</code> Literal 包含 <code>"humming"</code>, 说明为 <code>Use Humming Mixed Precision kernels</code>, 见 <code>vllm/config/kernel.py:122-137</code> 与 <code>vllm/config/kernel.py:171-186</code>。</li>
+  <li>MXFP4 oracle backend enum: <code>Mxfp4MoeBackend.HUMMING = "HUMMING"</code>, 见 <code>vllm/model_executor/layers/fused_moe/oracle/mxfp4.py:60-89</code>。</li>
+</ul>
+<div class="box">边界:本仓库没有 <code>csrc/humming*.cu</code> 这类自带 CUDA 实现。<code>humming.py</code> 在 import 阶段从外部包导入 <code>humming.dtypes</code>、<code>humming.layer.HummingMethod</code>、<code>humming.schema</code>、<code>humming.utils.weight.quantize_weight</code>, 见 <code>vllm/model_executor/layers/quantization/humming.py:51-67</code>。Dockerfile 中安装的是 <code>git+https://github.com/novitalabs/humming-int.git@dev#egg=humming</code>, 见 <code>docker/Dockerfile:725-731</code>。</div>
+
+<h2>推理流程位置</h2>
+<p>Humming 的主战场是 MoE FFN。一个典型 MoE 层先通过 router 选专家,再把 token 分派给 expert GEMM,最后按 top-k 权重合并输出。vLLM 的 modular MoE 注释把流程概括成:</p>
+<pre><code>[Router] -&gt; [Quantize-Dispatch] -&gt; [Permute-Experts-Unpermute] -&gt; [Combine]</code></pre>
+<p>这段分层定义位于 <code>vllm/model_executor/layers/fused_moe/modular_kernel.py:46-80</code>。Humming 对应其中的 <code>FusedMoEExpertsModular</code> expert compute 段,具体做两次 expert GEMM:</p>
+<table>
+<thead><tr><th>阶段</th><th>Humming 相关动作</th><th>关键文件:行</th></tr></thead>
+<tbody>
+<tr><td>模型构建</td><td><code>FusedMoE</code> 注册为 pluggable layer, 构造 <code>moe_config</code>, 从全局 <code>kernel_config.moe_backend</code> 记录后端选择。</td><td><code>fused_moe/layer.py:71-73</code>, <code>fused_moe/layer.py:318-341</code></td></tr>
+<tr><td>选择 quant method</td><td><code>FusedMoE.__init__</code> 调 <code>quant_config.get_quant_method(self, prefix)</code>; 若为 Humming, 返回 <code>HummingMoEMethod</code>。</td><td><code>fused_moe/layer.py:351-369</code>, <code>quantization/humming.py:334-353</code></td></tr>
+<tr><td>创建权重参数</td><td><code>HummingMoEMethod.create_weights()</code> 为 <code>w13</code> 和 <code>w2</code> 创建 Humming 所需 tensor attrs, 每个 sublayer 包含 weight / scale / zero point / global scale 等可能参数。</td><td><code>quantization/humming.py:702-759</code></td></tr>
+<tr><td>权重加载后处理</td><td>模型加载器遍历 module, 调用 quant method 的 <code>process_weights_after_loading()</code>; Humming 在这里转换 checkpoint 权重格式、准备 meta、预处理权重。</td><td><code>model_loader/utils.py:99-112</code>, <code>quantization/humming.py:794-893</code></td></tr>
+<tr><td>forward 入口</td><td><code>FusedMoE.forward()</code> 调 runner; runner 通过 custom op <code>torch.ops.vllm.moe_forward</code> 回到 <code>_forward_impl</code>。</td><td><code>fused_moe/layer.py:1306-1312</code>, <code>runner/moe_runner.py:592-642</code>, <code>runner/moe_runner.py:90-105</code></td></tr>
+<tr><td>router 选专家</td><td>非 monolithic 路径中, runner 调 <code>router.select_experts()</code> 得到 <code>topk_weights</code> 和 <code>topk_ids</code>, 再调 quant method 的 <code>apply()</code>。</td><td><code>runner/moe_runner.py:496-537</code>, <code>runner/moe_runner.py:742-799</code></td></tr>
+<tr><td>Humming expert compute</td><td><code>HummingMoEMethod.apply()</code> 或 modular wrapper 进入 <code>Humming*Experts.main_apply()</code>, 执行 <code>w13</code> Humming GEMM、MoE activation、<code>w2</code> Humming GEMM、top-k combine。</td><td><code>quantization/humming.py:926-952</code>, <code>fused_humming_moe.py:549-617</code>, <code>fused_humming_moe.py:638-716</code></td></tr>
+</tbody>
+</table>
+
+<h2>两条集成路径</h2>
+<h3>1. quantization=humming</h3>
+<p>这是 Humming 作为 quantization method 的路径。注册点在 <code>vllm/model_executor/layers/quantization/__init__.py</code>:</p>
+<ul>
+  <li><code>QuantizationMethods</code> 包含 <code>"humming"</code>, 见 <code>quantization/__init__.py:12-47</code>。</li>
+  <li><code>get_quantization_config()</code> lazy import <code>HummingConfig</code>, 并把 <code>"humming"</code> 映射到 <code>HummingConfig</code>, 见 <code>quantization/__init__.py:109-170</code>。</li>
+  <li><code>ModelConfig._verify_quantization()</code> 在用户显式指定 <code>self.quantization == "humming"</code> 时把 <code>humming</code> 放到 override 列表最前, 见 <code>vllm/config/model.py:1002-1038</code>。</li>
+</ul>
+<p><code>HummingConfig.get_quant_method()</code> 根据 layer 类型分发:</p>
+<pre><code>LinearBase     -&gt; HummingLinearMethod
+RoutedExperts  -&gt; HummingMoEMethod
+无 layer config -&gt; 对 Linear / MoE 回落到 unquantized method</code></pre>
+<p>对应源码在 <code>vllm/model_executor/layers/quantization/humming.py:334-353</code>。其中 Linear 路径会在 <code>HummingLinearMethod.apply()</code> 中展平输入并调用 <code>HummingMethod.forward_layer()</code>, 见 <code>quantization/humming.py:610-623</code>。MoE 路径则在 <code>HummingMoEMethod.apply()</code> 中调用 Humming experts, 见 <code>quantization/humming.py:926-952</code>。</p>
+<p class="warn">GPT-OSS 特例:如果模型类型是 <code>gpt_oss</code> 且 HF quant method 是 <code>mxfp4</code>, 用户不能用 <code>--quantization humming</code>; 代码抛错提示改用 <code>--moe-backend humming</code>, 见 <code>quantization/humming.py:212-225</code>。</p>
+
+<h3>2. moe-backend=humming for MXFP4 / GPT-OSS</h3>
+<p>这是 Humming 作为 MoE backend 的路径,主要由 MXFP4 oracle 接入:</p>
+<ul>
+  <li><code>KernelConfig.moe_backend</code> 接收 <code>"humming"</code>, 见 <code>vllm/config/kernel.py:122-137</code>。</li>
+  <li><code>map_mxfp4_backend()</code> 把 <code>"humming"</code> 映射为 <code>[Mxfp4MoeBackend.HUMMING]</code>, 见 <code>fused_moe/oracle/mxfp4.py:229-267</code>。</li>
+  <li><code>backend_to_kernel_cls(HUMMING)</code> 返回 <code>BatchedHummingGroupedExperts</code>、<code>HummingGroupedExperts</code>、<code>HummingIndexedExperts</code>, 见 <code>fused_moe/oracle/mxfp4.py:112-171</code>。</li>
+  <li>显式 backend 优先于 auto: <code>select_mxfp4_moe_backend()</code> 在 <code>runner_backend != "auto"</code> 时只检查用户指定 backend, 见 <code>fused_moe/oracle/mxfp4.py:404-460</code>。</li>
+</ul>
+<p>需要注意, auto priority 列表没有 Humming: GPT-OSS priority 包含 FlashInfer TRTLLM、AITER、Triton、FlashInfer CUTLASS、Marlin、XPU, 见 <code>fused_moe/oracle/mxfp4.py:270-289</code>; 通用 MXFP4 priority 包含 FlashInfer TRTLLM、DeepGEMM、Marlin, 见 <code>fused_moe/oracle/mxfp4.py:292-311</code>。因此 Humming 在 MXFP4 里是显式 <code>--moe-backend humming</code> 路径,不是 auto 默认候选。</p>
+
+<h2>Humming MoE 内部执行</h2>
+<p>Humming experts 有三种实现类,均继承 <code>HummingExpertsBase</code>:</p>
+<table>
+<thead><tr><th>类</th><th>activation format</th><th>GEMM type</th><th>选择条件</th></tr></thead>
+<tbody>
+<tr><td><code>HummingIndexedExperts</code></td><td><code>Standard</code></td><td><code>HummingGemmType.INDEXED</code></td><td><code>VLLM_HUMMING_MOE_GEMM_TYPE=indexed</code>, 或非 SM90+ auto。</td></tr>
+<tr><td><code>HummingGroupedExperts</code></td><td><code>Standard</code></td><td><code>HummingGemmType.GROUPED_CONTIGUOUS</code></td><td><code>VLLM_HUMMING_MOE_GEMM_TYPE=grouped/grouped_contiguous</code>, 或 SM90+ auto。</td></tr>
+<tr><td><code>BatchedHummingGroupedExperts</code></td><td><code>BatchedExperts</code></td><td><code>HummingGemmType.GROUPED_MASKED</code></td><td>当 prepare/finalize 选择 batched experts activation format 时使用。</td></tr>
+</tbody>
+</table>
+<p><code>get_humming_moe_gemm_type()</code> 的环境变量解析和默认策略见 <code>fused_moe/experts/fused_humming_moe.py:51-75</code>。Humming experts 声明当前设备需要 CUDA 且 capability 至少 7.5, 见 <code>fused_humming_moe.py:159-163</code>; <code>HummingConfig.get_min_capability()</code> 返回 75, 见 <code>quantization/humming.py:197-202</code>。</p>
+<p>三种 experts 的共同初始化会生成 compute config 和 tuning config:</p>
+<ul>
+  <li><code>use_batch_invariant</code> 来自 <code>VLLM_BATCH_INVARIANT</code>。</li>
+  <li><code>use_f16_accum</code> 来自 <code>VLLM_HUMMING_USE_F16_ACCUM</code>。</li>
+  <li><code>gemm_type</code> 来自具体 experts 类的 <code>humming_gemm_type()</code>。</li>
+  <li>分别为 <code>w13</code> 和 <code>w2</code> 调 <code>HummingMethod.get_default_tuning_configs()</code>。</li>
+</ul>
+<p>对应源码在 <code>fused_humming_moe.py:78-124</code>。</p>
+
+<h3>Indexed 路径</h3>
+<p><code>HummingIndexedExperts.main_apply()</code> 的关键步骤:</p>
+<ol>
+  <li>准备 workspace: <code>prepare_buffers()</code>, 见 <code>fused_humming_moe.py:558-565</code>。</li>
+  <li>用 <code>moe_align_block_size()</code> 生成 <code>sorted_ids</code>、<code>expert_ids</code>、<code>num_tokens_padded</code>, 见 <code>fused_humming_moe.py:486-547</code>。</li>
+  <li>调用 <code>HummingMethod.may_quant_input(..., sublayer_name="w13")</code>, 见 <code>fused_humming_moe.py:573-578</code>。</li>
+  <li>调用 <code>HummingMethod.forward_layer(..., sublayer_name="w13")</code> 做 gate/up GEMM, 见 <code>fused_humming_moe.py:580-587</code>。</li>
+  <li>调用 <code>apply_activation()</code> 做 MoE activation, 见 <code>fused_humming_moe.py:589-593</code>。</li>
+  <li>再次 <code>may_quant_input()</code>, 然后 <code>forward_layer(..., sublayer_name="w2")</code> 做 down GEMM, 见 <code>fused_humming_moe.py:595-609</code>。</li>
+  <li>用 <code>moe_fused_mul_sum()</code> 按 top-k 权重合并, 见 <code>fused_humming_moe.py:611-617</code>。</li>
+</ol>
+
+<h3>Grouped 路径</h3>
+<p><code>HummingGroupedExperts.main_apply()</code> 先用 <code>moe_permute()</code> 按专家重排 token, 给 Humming grouped GEMM 提供 <code>expert_layout=expert_first_token_offset</code>; 两次 <code>HummingMethod.forward_layer()</code> 后, 用 <code>moe_unpermute()</code> 恢复 token 顺序并合并 top-k 权重。关键行号:</p>
+<ul>
+  <li>permute: <code>fused_humming_moe.py:657-664</code></li>
+  <li><code>w13</code> Humming forward: <code>fused_humming_moe.py:666-683</code></li>
+  <li>activation: <code>fused_humming_moe.py:685-689</code></li>
+  <li><code>w2</code> Humming forward: <code>fused_humming_moe.py:691-708</code></li>
+  <li>unpermute/combine: <code>fused_humming_moe.py:710-716</code></li>
+</ul>
+
+<h3>Batched grouped 路径</h3>
+<p><code>BatchedHummingGroupedExperts</code> 用 batched experts activation format, <code>expert_layout</code> 来自 <code>expert_tokens_meta.expert_num_tokens</code>。它的 <code>w13</code>/<code>w2</code> 调用同样落在 <code>HummingMethod.forward_layer()</code>, 见 <code>fused_humming_moe.py:719-795</code>。这个路径通常由 modular MoE 的 prepare/finalize 选择出来; <code>HummingMoEMethod.select_gemm_impl()</code> 在 activation format 为 <code>BatchedExperts</code> 时返回 <code>BatchedHummingGroupedExperts</code>, 见 <code>quantization/humming.py:904-924</code>。</p>
+
+<h2>初始化、权重转换和 dispatch</h2>
+<h3>权重格式转换</h3>
+<p>Humming 需要把 checkpoint 权重转换为 Humming 标准格式并做权重预处理。MoE 路径的 <code>process_weights_after_loading()</code> 对 <code>w13</code>/<code>w2</code> 两个 sublayer 分别处理:</p>
+<ul>
+  <li>从 layer state dict 取出当前 sublayer 参数, 见 <code>quantization/humming.py:800-809</code>。</li>
+  <li>为 <code>w13</code> 设置两个 shape_n stack, 因为 gate/up 合并, 见 <code>quantization/humming.py:811-815</code>。</li>
+  <li>调用 <code>weight_schema.convert_humming()</code> 和 <code>input_schema.convert_humming()</code>, 见 <code>quantization/humming.py:816-830</code>。</li>
+  <li>调用 <code>HummingMethod.prepare_layer_meta(..., sublayer_name=sublayer_name)</code>, 见 <code>quantization/humming.py:877-890</code>。</li>
+  <li>调用 <code>HummingMethod.transform_humming_layer()</code> 做 inference 前预处理, 见 <code>quantization/humming.py:892-893</code>。</li>
+</ul>
+<p>GPT-OSS/MXFP4 oracle 路径也会调用工具函数 <code>prepare_humming_moe_layer()</code>, 逻辑在 <code>quantization/utils/humming_utils.py:85-165</code>。GPT-OSS 使用 <code>{"quant_method": "gpt_oss_mxfp4"}</code>, 见 <code>fused_moe/oracle/mxfp4.py:732-745</code>; 普通 MXFP4 使用 <code>{"quant_method": "mxfp4"}</code>, 见 <code>fused_moe/oracle/mxfp4.py:1271-1284</code>。</p>
+
+<h3>MoE quant config</h3>
+<p>MoE runner 在 forward impl 入口调用 <code>layer.ensure_moe_quant_config_init()</code>, 见 <code>runner/moe_runner.py:742-764</code>。该函数在第一次需要时调用 quant method 的 <code>get_fused_moe_quant_config()</code>, 见 <code>fused_moe/layer.py:1293-1304</code>。Humming 的实现从 <code>layer.input_schemas["w13"]</code> 与 <code>layer.weight_schemas["w13"]</code> 推导 activation / weight quant desc, 并返回 <code>FusedMoEQuantConfig</code>, 见 <code>quantization/utils/humming_utils.py:167-222</code>。</p>
+
+<h3>dispatch 与 modular wrapper</h3>
+<p>Humming 有旧式 quant method 直调和 modular MoE kernel 包装两种运行形态:</p>
+<table>
+<thead><tr><th>形态</th><th>触发</th><th>调用链</th></tr></thead>
+<tbody>
+<tr><td>内部 Humming method</td><td><code>HummingMoEMethod.process_weights_after_loading()</code> 结束后直接设置 <code>self.experts</code>。</td><td><code>MoERunner._apply_quant_method()</code> -&gt; <code>HummingMoEMethod.apply()</code> -&gt; <code>self.experts.main_apply()</code>, 见 <code>runner/moe_runner.py:522-537</code> 与 <code>quantization/humming.py:895-952</code>。</td></tr>
+<tr><td>modular MoE wrapper</td><td><code>FusedMoE.maybe_init_modular_kernel()</code> 创建 prepare/finalize, 再用 <code>FusedMoEModularMethod.make()</code> 包装旧 quant method。</td><td><code>FusedMoEModularMethod.apply()</code> -&gt; <code>FusedMoEKernel.apply()</code> -&gt; <code>FusedMoEKernelModularImpl._prepare()</code> -&gt; <code>Humming*Experts.apply()</code> -&gt; <code>_finalize()</code>, 见 <code>fused_moe/layer.py:453-479</code>, <code>fused_moe/fused_moe_modular_method.py:49-63</code>, <code>fused_moe/modular_kernel.py:1116-1202</code>, <code>fused_moe/modular_kernel.py:1265-1283</code>, <code>fused_moe/modular_kernel.py:1285-1351</code>。</td></tr>
+</tbody>
+</table>
+<p>modular wrapper 的核心是 <code>FusedMoEKernel</code>, 它要求 prepare/finalize 与 experts 都是 modular 或都 monolithic, 并在 <code>apply()</code> 中转到 modular impl, 见 <code>fused_moe/modular_kernel.py:1507-1543</code> 与 <code>fused_moe/modular_kernel.py:1633-1660</code>。</p>
+
+<h2>平台、环境变量和限制</h2>
+<table>
+<thead><tr><th>项</th><th>源码依据</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>外部包可用性</td><td><code>quantization/humming.py:51-76</code></td><td>import 失败时 <code>HummingMethod = None</code>; 构造 <code>HummingConfig</code> 会断言外部 <code>humming</code> 包可用。</td></tr>
+<tr><td>最小 capability</td><td><code>quantization/humming.py:197-202</code>, <code>fused_humming_moe.py:159-163</code></td><td>quant config 和 experts 都要求 CUDA capability 至少 7.5; grouped auto 在 SM90+ 默认启用。</td></tr>
+<tr><td><code>VLLM_HUMMING_ONLINE_QUANT_CONFIG</code></td><td><code>envs.py:164</code>, <code>envs.py:1347-1350</code>, <code>quantization/humming.py:297-307</code></td><td>无完整 config 或 force requant 时, 可驱动在线 weight quant / requant。</td></tr>
+<tr><td><code>VLLM_HUMMING_INPUT_QUANT_CONFIG</code></td><td><code>envs.py:165</code>, <code>envs.py:1351-1354</code>, <code>quantization/humming.py:315-323</code></td><td>强制或补充 activation input quant schema。</td></tr>
+<tr><td><code>VLLM_HUMMING_USE_F16_ACCUM</code></td><td><code>envs.py:166</code>, <code>envs.py:1355-1358</code>, <code>fused_humming_moe.py:102-124</code></td><td>写入 compute config 和 tuning config, 影响 Humming kernel accumulator 行为。</td></tr>
+<tr><td><code>VLLM_HUMMING_MOE_GEMM_TYPE</code></td><td><code>envs.py:167</code>, <code>envs.py:1359-1364</code>, <code>fused_humming_moe.py:51-71</code></td><td>支持 <code>indexed</code>、<code>grouped/grouped_contiguous</code>、<code>auto</code>; 无效值会 warning 并回到自动选择。</td></tr>
+<tr><td>FlashInfer A2A 关系</td><td><code>fused_humming_moe.py:184-193</code>, <code>fused_humming_moe.py:470-474</code>, <code>fused_humming_moe.py:632-636</code></td><td>Humming base 阻止 FlashInfer two-sided / one-sided A2A; Standard-format Indexed/Grouped 覆盖为支持 one-sided, 但仍不支持 two-sided。</td></tr>
+<tr><td>LoRA</td><td><code>modular_kernel.py:746-753</code>, Humming 未覆盖 <code>supports_lora()</code></td><td>按基类默认, Humming experts 不声明原生 LoRA 支持。</td></tr>
+</tbody>
+</table>
+
+<h2>与现有 kernel 的关系</h2>
+<p>Humming 不是 attention backend,也不是 sampling kernel。它和 Marlin、DeepGEMM、FlashInfer CUTLASS/TRTLLM、Triton、AITER 等处在同一类 “MoE expert computation backend” 选择空间里。MXFP4 oracle 的 backend 枚举把这些放在同一张表中, 见 <code>fused_moe/oracle/mxfp4.py:60-89</code>。</p>
+<p>差异在于:</p>
+<ul>
+  <li>FlashInfer TRTLLM / CUTLASS 等路径通常直接选择对应外部 fused MoE kernel 类。</li>
+  <li>Marlin 路径有单独权重格式准备函数。</li>
+  <li>Humming 路径先通过 <code>prepare_humming_moe_layer()</code> 或 <code>HummingMoEMethod.process_weights_after_loading()</code> 转换成 Humming schema, 然后在 forward 时通过 <code>HummingMethod.forward_layer()</code> 做两段 GEMM。</li>
+</ul>
+<p>如果用户没有显式选择 Humming, GPT-OSS/MXFP4 的 auto 列表不会默认探测 Humming。若要验证 Humming 性能,配置层应显式使用 <code>--moe-backend humming</code>, 并记录 <code>VLLM_HUMMING_MOE_GEMM_TYPE</code>、GPU capability、模型 quant config 和 profiler trace 中的实际外部 kernel 名称。</p>
+
+<h2>最小调用链图</h2>
+<pre><code>Transformer layer MoE FFN
+  -&gt; FusedMoE.forward()
+     fused_moe/layer.py:1306-1312
+  -&gt; MoERunner.forward()
+     runner/moe_runner.py:592-642
+  -&gt; torch.ops.vllm.moe_forward / _moe_forward()
+     runner/moe_runner.py:90-105, 167-181
+  -&gt; MoERunner._forward_impl()
+     runner/moe_runner.py:742-799
+  -&gt; MoERunner._apply_quant_method()
+     runner/moe_runner.py:496-537
+  -&gt; router.select_experts() -> topk_weights, topk_ids
+     runner/moe_runner.py:522-526
+  -&gt; HummingMoEMethod.apply() or FusedMoEModularMethod.apply()
+     quantization/humming.py:926-952
+     fused_moe/fused_moe_modular_method.py:89-111
+  -&gt; HummingIndexedExperts / HummingGroupedExperts / BatchedHummingGroupedExperts
+     fused_humming_moe.py:458-795
+  -&gt; HummingMethod.forward_layer(... sublayer_name="w13")
+  -&gt; apply_moe_activation()
+  -&gt; HummingMethod.forward_layer(... sublayer_name="w2")
+  -&gt; moe_fused_mul_sum() or moe_unpermute() combine</code></pre>
+
+<h2>阅读结论</h2>
+<ul>
+  <li><span class="ok">确认:</span> “humming kernel” 在 vLLM 中的具体对应是 <code>HummingConfig</code> + <code>HummingLinearMethod</code>/<code>HummingMoEMethod</code> + <code>Humming*Experts</code> 这一组适配实现,底层执行入口是外部 <code>humming.layer.HummingMethod</code>。</li>
+  <li><span class="ok">确认:</span> 它位于 MoE FFN/expert GEMM 环节,覆盖 prefill/decode 中所有会执行 MoE layer 的 token,不在 attention/KV/sampling 环节。</li>
+  <li><span class="ok">确认:</span> 集成机制包含 quantization method 注册、<code>--moe-backend humming</code> backend 映射、MXFP4 oracle 显式 backend 选择、权重 post-load 转换、MoE modular kernel prepare/finalize 编排。</li>
+  <li><span class="warn">限制:</span> vLLM 当前源码不能说明外部 <code>humming</code> 包内部 CUDA kernel 的精确 symbol; 需要 profiler 或外部包源码才能继续下钻。</li>
+</ul>
+</body>
+</html>
