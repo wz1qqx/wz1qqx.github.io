@@ -67,3 +67,4 @@ nav:
     - 跨模型对比: codepath/compare.html
     - Humming kernel 集成笔记: codepath/humming-kernel.html
     - Marlin kernel 集成笔记: codepath/marlin-kernel.html
+    - MoE backend 学习笔记: codepath/moe-backends.html
