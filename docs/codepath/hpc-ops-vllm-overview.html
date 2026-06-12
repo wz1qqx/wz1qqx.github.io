@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HPC-Ops × vLLM 推理核心算子 codepath 总览</title>
+<style>
+body{font:15px/1.7 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1080px;margin:2rem auto;padding:0 1.2rem;color:#1b1f24}
+h1{border-bottom:2px solid #0969da;padding-bottom:.3em}
+h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em;margin-top:2rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+.lead{color:#57606a;font-size:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;margin:1rem 0}
+.card{border:1px solid #d0d7de;border-radius:8px;padding:14px 16px;background:#fff}
+.card h3{margin:.2rem 0 .4rem}
+.badge{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;vertical-align:middle}
+.done{background:#e6f4ea;color:#0a7d20}
+code{background:#f6f8fa;padding:1px 6px;border-radius:4px;font-size:13px}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.meta{color:#57606a;font-size:13px}
+</style>
+</head>
+<body>
+<h1>HPC-Ops × vLLM 推理核心算子 codepath 总览</h1>
+<p class="lead">以腾讯混元 AI Infra 的 <b>HPC-Ops</b> 五大推理核心算子升级为线索,逐块对照 vLLM 在
+<code>vllm-int</code> 源码里的真实实现位置、数据流与设计取舍。每个主题一页,均以代码为准(给 file:line),
+配 mermaid 流程图与对比表。</p>
+<p class="meta">参考文章:《腾讯混元 AI Infra 进化:HPC-Ops 推理核心算子全面升级》 ·
+HPC-Ops: <a href="https://github.com/Tencent/hpc-ops">github.com/Tencent/hpc-ops</a></p>
+
+<h2>五大算子 ↔ vLLM 模块对照</h2>
+<table>
+<tr><th>HPC-Ops 算子</th><th>优化要点</th><th>vLLM 对应模块</th><th>codepath 页</th></tr>
+<tr>
+  <td>Attention</td>
+  <td>运行时动态负载调度、Tile 均衡、split-kv,治长短请求混排的长尾延迟</td>
+  <td><code>model_executor/layers/attention/</code>、<code>v1/attention/backends/</code></td>
+  <td><a href="attention-scheduling.html">Attention 调度与 split-kv</a> <span class="badge done">已完成</span></td>
+</tr>
+<tr>
+  <td>Router GEMM</td>
+  <td>双 BF16 模拟 FP32,兼顾 MoE router 精度与算力利用率</td>
+  <td><code>model_executor/layers/fused_moe/router/</code></td>
+  <td><a href="moe-router-gating.html">MoE router/gating</a> <span class="badge done">已完成</span></td>
+</tr>
+<tr>
+  <td>FusedMoE</td>
+  <td>MoE 全模块流水线融合,消除显存搬运与 kernel 启动开销</td>
+  <td><code>model_executor/layers/fused_moe/</code>(experts/runner/modular_kernel)</td>
+  <td><a href="moe-backends.html">MoE backend 数据流与 dispatch</a> <span class="badge done">已完成</span></td>
+</tr>
+<tr>
+  <td>Fused AllReduce+Norm</td>
+  <td>跨 GPU 通信 + 残差 + RMSNorm 深度融合(<code>RMSNorm(AllReduce(x)+residual)</code>)</td>
+  <td><code>distributed/</code>、<code>model_executor/layers/layernorm.py</code></td>
+  <td><a href="tp-comm-fusion.html">TP 通信与 RMSNorm 融合</a> <span class="badge done">已完成</span></td>
+</tr>
+<tr>
+  <td>Sampler</td>
+  <td>采样后处理(温度/top-k/top-p/重复惩罚/softmax)融合为 2 个 CUDA kernel</td>
+  <td><code>v1/sample/</code>(sampler/rejection_sampler/ops/logits_processor)</td>
+  <td><a href="sampler-postprocess.html">Sampler 后处理</a> <span class="badge done">已完成</span></td>
+</tr>
+</table>
+
+<h2>全部 codepath 页</h2>
+<div class="grid">
+  <div class="card"><h3><a href="attention-scheduling.html">Attention 调度与 split-kv</a></h3>
+    <p>vLLM attention backend 的任务划分、num_splits/split-kv 决策、prefill/decode 拆分,对照 HPC-Ops 动态 Tile 调度。</p></div>
+  <div class="card"><h3><a href="moe-router-gating.html">MoE router/gating</a></h3>
+    <p>fused_moe/router 的 router 工厂、topk/grouped-topk、gating 精度处理,对照 HPC-Ops 双 BF16 Router GEMM。</p></div>
+  <div class="card"><h3><a href="moe-backends.html">MoE backend 数据流</a></h3>
+    <p>router→expert 选择→expert GEMM→合并的全链路,triton/cutlass/marlin/deep_gemm/flashinfer 各 backend 与 dispatch。</p></div>
+  <div class="card"><h3><a href="tp-comm-fusion.html">TP 通信与 RMSNorm 融合</a></h3>
+    <p>distributed all_reduce 路径、device communicator、layernorm,对照 HPC-Ops 通信-计算一体化。</p></div>
+  <div class="card"><h3><a href="sampler-postprocess.html">Sampler 后处理</a></h3>
+    <p>v1/sample 解码末端采样全流程与算子串联,对照 HPC-Ops fused_sampler 2-kernel 融合。</p></div>
+  <div class="card"><h3><a href="humming-kernel.html">Humming kernel 集成</a></h3>
+    <p>外部 humming 量化包经 quantization 注册接入 MoE/Linear 的机制(早前笔记)。</p></div>
+  <div class="card"><h3><a href="marlin-kernel.html">Marlin kernel 集成</a></h3>
+    <p>GPTQ/AWQ 量化的 INT4 GEMM,作用于 Linear 与 MoE expert GEMM(早前笔记)。</p></div>
+</div>
+
+<p class="meta">说明:这些页面探索的是 vLLM 现状的对应实现,HPC-Ops 是独立的算子库,文中对照旨在帮助理解
+"同一推理瓶颈,vLLM 怎么做、HPC-Ops 怎么进一步优化",不代表 vLLM 已集成 HPC-Ops。</p>
+</body>
+</html>

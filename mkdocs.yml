@@ -65,6 +65,13 @@ nav:
     - 总览: codepath/overview.html
     - CodePath 地图: codepath/index.html
     - 跨模型对比: codepath/compare.html
-    - Humming kernel 集成笔记: codepath/humming-kernel.html
-    - Marlin kernel 集成笔记: codepath/marlin-kernel.html
-    - MoE backend 学习笔记: codepath/moe-backends.html
+    - HPC-Ops × vLLM 核心算子:
+      - 总览(五算子对照): codepath/hpc-ops-vllm-overview.html
+      - Attention 调度与 split-kv: codepath/attention-scheduling.html
+      - MoE router/gating: codepath/moe-router-gating.html
+      - MoE backend 数据流: codepath/moe-backends.html
+      - TP 通信与 RMSNorm 融合: codepath/tp-comm-fusion.html
+      - Sampler 后处理: codepath/sampler-postprocess.html
+    - Kernel 集成:
+      - Humming kernel: codepath/humming-kernel.html
+      - Marlin kernel: codepath/marlin-kernel.html
