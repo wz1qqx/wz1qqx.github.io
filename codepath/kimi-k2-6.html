@@ -1,0 +1,36 @@
+<!doctype html><html><head><meta charset=utf-8><title>codepath: Kimi-K2.6</title><style>
+body{font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+h1,h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+.confirmed{color:#0a7d20;font-weight:600}.log_only{color:#b35900;font-weight:600}
+.config_only{color:#57606a}.trace_only{color:#0969da}
+.share{font-variant-numeric:tabular-nums;text-align:right}
+.alt{color:#6e40c9;font-size:12px}
+.meta{color:#57606a;font-size:12px}
+nav a{margin-right:1rem}
+</style></head><body>
+<nav><a href="index.html">&larr; index</a><a href="compare.html">cross-model compare</a></nav>
+<h1>codepath map: Kimi-K2.6</h1>
+<p class=meta>vLLM <code>0.15.2rc1.dev3356+g666ad7d3c</code> &middot; context <code>ctx-kimi-full</code> &middot; cc sm90 &middot; generated 2026-06-04T11:27:58.505Z</p>
+<p class=meta>Source of truth: <code>.harness/codepath/kimi-k2-6/ctx-kimi-full.json</code> (git-tracked). This page is a generated view.</p>
+<table><thead><tr><th>component</th><th>status</th><th>config selected (log claim)</th><th>trace (ground truth)</th><th>config-reachable alternatives (Tier-1)</th></tr></thead><tbody>
+<tr><td>moe_ffn</td><td class="confirmed">confirmed</td><td>moe_method=<code>CompressedTensorsWNA16MarlinMoEMethod</code><br>moe_backend=<code>Marlin(WNA16)</code></td><td class=share>56.3%<br><span class=meta>void marlin_moe_wna16::Marlin&lt;1125899906909960l, 1125899907892224l, 11</span></td><td><div class=alt>DeepGEMM</div></td></tr>
+<tr><td>communication</td><td class="confirmed">confirmed</td><td>allreduce=<code>['CUSTOM', 'SYMM_MEM', 'PYNCCL']</code><br>allreduce=<code>['PYNCCL']</code><br>allreduce_flashinfer=<code>trtllm</code></td><td class=share>20.4%<br><span class=meta>ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage&lt;4096</span></td><td>&mdash;</td></tr>
+<tr><td>gemm</td><td class="trace_only">trace_only</td><td>&mdash;</td><td class=share>11.0%<br><span class=meta>nvjet_sm90_tst_192x192_64x4_1x2_h_bz_coopB_TNN</span></td><td>&mdash;</td></tr>
+<tr><td>reduce</td><td class="trace_only">trace_only</td><td>&mdash;</td><td class=share>4.5%<br><span class=meta>void at::native::reduce_kernel&lt;128, 4, at::native::ReduceOp&lt;c10::BFloa</span></td><td>&mdash;</td></tr>
+<tr><td>attention</td><td class="confirmed">confirmed</td><td>attn_backend=<code>FLASHMLA</code><br>mla_prefill=<code>FLASH_ATTN</code></td><td class=share>2.0% <span class=meta>(low)</span><br><span class=meta>void cutlass::device_kernel&lt;flash::enable_sm90_or_later&lt;flash::FlashAt</span></td><td><div class=alt>['FLASHMLA', 'TRITON_MLA']</div></td></tr>
+<tr><td>norm</td><td class="confirmed">confirmed</td><td>ir_op_priority=<code>rms_norm=['native'], fused_add_rms_norm=['native']</code></td><td class=share>2.0% <span class=meta>(low)</span><br><span class=meta>triton_red_fused_fused_add_rms_norm_min_latency_fused_qkv_a_proj_2</span></td><td>&mdash;</td></tr>
+<tr><td>memory</td><td class="trace_only">trace_only</td><td>&mdash;</td><td class=share>1.9% <span class=meta>(low)</span><br><span class=meta>void at::native::vectorized_elementwise_kernel&lt;4, at::native::FillFunc</span></td><td>&mdash;</td></tr>
+<tr><td>activation</td><td class="trace_only">trace_only</td><td>&mdash;</td><td class=share>0.7% <span class=meta>(low)</span><br><span class=meta>void vllm::act_and_mul_kernel&lt;c10::BFloat16, __nv_bfloat162, &amp;(c10::BF</span></td><td>&mdash;</td></tr>
+<tr><td>other</td><td class="trace_only">trace_only</td><td>&mdash;</td><td class=share>0.7% <span class=meta>(low)</span><br><span class=meta>triton_red_fused_4</span></td><td>&mdash;</td></tr>
+<tr><td>cache</td><td class="trace_only">trace_only</td><td>&mdash;</td><td class=share>0.4% <span class=meta>(low)</span><br><span class=meta>void vllm::concat_and_cache_mla_kernel&lt;__nv_bfloat16, unsigned char, (</span></td><td>&mdash;</td></tr>
+<tr><td>sampling</td><td class="log_only">log_only</td><td>sampler=<code>FlashInfer</code></td><td class=share>0.0%<br><span class=meta>void at::native::reduce_kernel&lt;512, 1, at::native::ReduceOp&lt;float, at:</span></td><td>&mdash;</td></tr>
+<tr><td>kv_cache</td><td class="config_only">config_only</td><td>kv_cache_dtype=<code>fp8_e4m3</code></td><td class=share><span class=meta>&mdash;</span></td><td>&mdash;</td></tr>
+<tr><td>scheduler</td><td class="config_only">config_only</td><td>chunked_prefill=<code>enabled</code></td><td class=share><span class=meta>&mdash;</span></td><td>&mdash;</td></tr>
+<tr><td>compile</td><td class="config_only">config_only</td><td>custom_fusions=<code>allreduce_rms</code></td><td class=share><span class=meta>&mdash;</span></td><td>&mdash;</td></tr>
+</tbody></table>
+<p class=meta>status: <span class=confirmed>confirmed</span>=log+trace agree &middot; <span class=log_only>log_only</span>=claimed but trace ~0 (stale/cold) &middot; <span class=config_only>config_only</span>=no standalone kernel &middot; <span class=trace_only>trace_only</span>=in trace, no log line</p>
+</body></html>

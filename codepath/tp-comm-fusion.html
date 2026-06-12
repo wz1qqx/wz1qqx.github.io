@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM TP 通信与 RMSNorm 融合学习笔记</title>
+<style>
+body{font:14px/1.65 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1120px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+h1,h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em}
+h2{margin-top:2rem}
+h3{margin-top:1.4rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;overflow:auto}
+pre code{background:transparent;padding:0}
+pre.mermaid{background:#fff;border:1px solid #d0d7de;border-radius:6px;padding:16px}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.lead{color:#57606a;font-size:15px}
+.meta{color:#57606a;font-size:12px}
+.ok{color:#0a7d20;font-weight:600}
+.warn{color:#b35900;font-weight:600}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da}
+.box{border-left:4px solid #0969da;background:#f6f8fa;padding:8px 12px;margin:12px 0}
+.small{font-size:12px;color:#57606a}
+nav a{margin-right:1rem}
+</style>
+</head>
+<body>
+<nav><a href="overview.html">&larr; overview</a><a href="index.html">codepath map</a><a href="moe-backends.html">moe backends</a><a href="attention-scheduling.html">attention scheduling</a></nav>
+
+<h1>vLLM TP 通信与 RMSNorm 融合学习笔记</h1>
+<p class="lead">结论先行:普通 vLLM eager 路径里,TP all-reduce 和 RMSNorm 是两层独立机制。<code>distributed/communication_op.py</code> 只把 tensor 交给 TP group 的 all-reduce;CUDA communicator 再按 NCCL symmetric memory、QuickReduce、FlashInfer all-reduce、custom all-reduce、Torch SymmMem、PyNccl、PyTorch fallback 的顺序选择通信后端。残差加法与 RMSNorm 在 <code>RMSNorm.forward()</code> / <code>ir.ops.fused_add_rms_norm</code> 中完成,它可以是本地 fused add+RMSNorm kernel,但不默认包含通信。</p>
+<p class="lead">同时,当前工作树确实存在编译期的 all-reduce+RMSNorm 融合:非 ROCm 路径可用 FlashInfer/TensorRT-LLM 风格的 <code>flashinfer_trtllm_fused_allreduce_norm</code>;ROCm AITER 路径可用 <code>rocm_aiter_fused_allreduce_rmsnorm</code>。这些路径由 FX/Inductor pattern pass 触发,受 TP size、FlashInfer/AITER 可用性、workspace、token 数和 dtype 等约束,不是 <code>tensor_model_parallel_all_reduce()</code> 的基础语义。</p>
+<p class="meta">源码基准:<code>/Users/f/Documents/vllm-workspace/tasks/opt-kimi-pd/vllm-int</code> 当前工作树。本文只依据本地源码行号;HPC-Ops 侧只按题述特征讨论,即 Fused AllReduce+Norm = TP 通信 + residual add + RMSNorm 一体化,不把未验证的外部实现细节写成事实。</p>
+
+<h2>一句话定位</h2>
+<table>
+<thead><tr><th>问题</th><th>vLLM 源码事实</th><th>和 HPC-Ops 题述方案的关系</th></tr></thead>
+<tbody>
+<tr><td>TP all-reduce 的用户入口</td><td><code>tensor_model_parallel_all_reduce(input_)</code> 只是 <code>return get_tp_group().all_reduce(input_)</code>,见 <code>vllm/distributed/communication_op.py:12-14</code>。</td><td>入口本身不是 fused op,也没有 residual 或 RMSNorm 参数。</td></tr>
+<tr><td>all-reduce 后端选择</td><td><code>GroupCoordinator.all_reduce()</code> 先处理 world size 和 custom op call,再进入 <code>device_communicator.all_reduce()</code>,见 <code>distributed/parallel_state.py:514-541</code>。CUDA communicator 的 per-call dispatch 顺序见 <code>device_communicators/cuda_communicator.py:241-298</code>。</td><td>通信后端可优化 all-reduce,但多数后端只看输入 tensor 的 dtype/shape/size,不感知后续 Norm。</td></tr>
+<tr><td>残差 + RMSNorm 是否融合</td><td><code>RMSNorm.forward_native()</code> 在 residual 存在时调用 <code>ir.ops.fused_add_rms_norm</code>,见 <code>model_executor/layers/layernorm.py:82-102</code>。<code>vllm_c</code> 实现最终调用 <code>torch.ops._C.fused_add_rms_norm</code>,见 <code>kernels/vllm_c.py:54-90</code>。</td><td>vLLM 有本地计算融合:residual add + RMSNorm。它与通信分离。</td></tr>
+<tr><td>通信 + residual + RMSNorm 是否融合</td><td>有可选编译期融合。<code>AllReduceFusedAddRMSNormPattern</code> 把 <code>all_reduce(input)</code> + <code>fused_add_rms_norm(allreduce_output, residual, weight)</code> 替换为 <code>flashinfer_trtllm_fused_allreduce_norm</code>,见 <code>compilation/passes/fusion/allreduce_rms_fusion.py:347-400</code>。ROCm AITER 类似替换见 <code>allreduce_rms_fusion.py:959-1000</code>。</td><td>这最接近 HPC-Ops 题述的一体化目标,但它不是基础 eager 路径,而是受编译和后端条件约束的 pattern fusion。</td></tr>
+<tr><td>Sequence Parallelism 的关系</td><td><code>SequenceParallelismPass</code> 识别 <code>AllReduce -&gt; RMSNorm</code> 或 <code>AllReduce -&gt; fused_add_rms_norm</code>,替换成 <code>ReduceScatter -&gt; local RMSNorm -&gt; AllGather</code>,见 <code>sequence_parallelism.py:495-512</code>。</td><td>这是通信分解与本地 Norm,不是单个 AllReduce+Norm kernel;源码注释说它为后续 GEMM+通信融合铺路。</td></tr>
+</tbody>
+</table>
+
+<div class="box">阅读边界:本文重点是 TP 通信、残差、RMSNorm。MoE all2all、attention Q/K Norm、MiniMax QK Norm、DeepSeek V4 router GEMV 里也有局部 norm fusion,但它们不是本文的 “TP all-reduce + residual + RMSNorm” 主路径。</div>
+
+<h2>关键文件地图</h2>
+<table>
+<thead><tr><th>文件</th><th>关键行</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td><code>vllm/distributed/communication_op.py</code></td><td><code>12-28</code></td><td>对外暴露 tensor parallel collectives:<code>all_reduce</code>、<code>all_gather</code>、<code>reduce_scatter</code>。本文件不做 backend 选择。</td></tr>
+<tr><td><code>vllm/distributed/parallel_state.py</code></td><td><code>130-135</code>, <code>514-541</code></td><td>把 custom op 的 group name 映射回 <code>GroupCoordinator</code>,并把 all-reduce 派发到 device communicator。</td></tr>
+<tr><td><code>device_communicators/cuda_communicator.py</code></td><td><code>45-59</code>, <code>74-116</code>, <code>178-239</code>, <code>241-298</code></td><td>初始化 PyNccl、Torch SymmMem、FlashInfer、custom all-reduce、QuickReduce,并按固定顺序选择每次 all-reduce 的实际后端。</td></tr>
+<tr><td><code>device_communicators/pynccl.py</code></td><td><code>31-57</code>, <code>166-197</code></td><td>封装 NCCL communicator;普通路径调用 <code>ncclAllReduce</code>,NCCL symmetric memory 路径注册 <code>all_reduce_symmetric_with_copy</code> custom op。</td></tr>
+<tr><td><code>device_communicators/symm_mem.py</code></td><td><code>25-115</code>, <code>116-155</code></td><td>基于 <code>torch.distributed._symmetric_memory</code> 初始化 multicast buffer,对 BF16 小尺寸张量调用 <code>multimem_all_reduce_</code> 或 <code>two_shot_all_reduce_</code>。</td></tr>
+<tr><td><code>device_communicators/quick_all_reduce.py</code></td><td><code>46-73</code>, <code>293-327</code></td><td>ROCm MI300 系列 QuickReduce;支持 FP、INT8、INT6、INT4 codec,按 dtype/size/contiguity 决定是否使用 <code>ops.qr_all_reduce</code>。</td></tr>
+<tr><td><code>model_executor/layers/layernorm.py</code></td><td><code>36-116</code></td><td><code>RMSNorm</code> 的模型层封装;无 residual 时调 <code>ir.ops.rms_norm</code>,有 residual 时调 <code>ir.ops.fused_add_rms_norm</code>。</td></tr>
+<tr><td><code>vllm/ir/ops/layernorm.py</code></td><td><code>9-21</code>, <code>39-58</code></td><td>RMSNorm 和 fused add RMSNorm 的 reference 语义:FP32 计算方差,残差加法后更新 residual,再归一化并乘 weight。</td></tr>
+<tr><td><code>vllm/kernels/vllm_c.py</code></td><td><code>22-44</code>, <code>54-90</code></td><td>给 IR op 注册 <code>vllm_c</code> CUDA-like 实现,调用 <code>torch.ops._C.rms_norm</code> 和 <code>torch.ops._C.fused_add_rms_norm</code>。</td></tr>
+<tr><td><code>compilation/passes/fusion/allreduce_rms_fusion.py</code></td><td><code>121-245</code>, <code>285-400</code>, <code>761-895</code>, <code>913-1085</code></td><td>编译期通信+Norm 融合:FlashInfer fused allreduce-norm custom op 注册、pattern replacement、pass 启用条件、ROCm AITER replacement。</td></tr>
+<tr><td><code>compilation/passes/fusion/sequence_parallelism.py</code></td><td><code>150-245</code>, <code>495-620</code></td><td>把 <code>AllReduce -&gt; RMSNorm</code> 改写成 sequence parallel 的 <code>ReduceScatter -&gt; local RMSNorm -&gt; AllGather</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>普通 TP all-reduce 数据流</h2>
+<p>普通路径从模型层的 row-parallel 输出开始。<code>RowParallelLinear.forward()</code> 在 <code>reduce_results</code> 且 TP size 大于 1 时调用 <code>tensor_model_parallel_all_reduce(output_parallel)</code>,见 <code>model_executor/layers/linear.py:1540-1566</code>。LLaMA/Qwen/Mixtral 这类模型随后把 attention 或 MLP 输出交给带 residual 的 RMSNorm,例如 LLaMA decoder layer 在 residual 存在时调用 <code>self.input_layernorm(hidden_states, residual)</code> 和 <code>self.post_attention_layernorm(hidden_states, residual)</code>,见 <code>model_executor/models/llama.py:320-333</code>。</p>
+
+<pre class="mermaid">
+flowchart TD
+  A["RowParallelLinear / TP-sharded output<br/>linear.py:1552-1559"] --> B["tensor_model_parallel_all_reduce<br/>communication_op.py:12-14"]
+  B --> C["GroupCoordinator.all_reduce<br/>parallel_state.py:514-541"]
+  C --> D{"world_size == 1?"}
+  D -- yes --> E["return input"]
+  D -- no --> F{"use custom op call?"}
+  F -- yes --> G["torch.ops.vllm.all_reduce(group_name)<br/>parallel_state.py:130-135,533-535"]
+  F -- no --> H["_all_reduce_out_place"]
+  G --> I["device_communicator.all_reduce"]
+  H --> I
+  I --> J["CudaCommunicator backend dispatch<br/>cuda_communicator.py:241-298"]
+  J --> K["all-reduced tensor"]
+  K --> L["RMSNorm.forward(residual)<br/>layernorm.py:82-116"]
+  L --> M["ir.ops.fused_add_rms_norm<br/>ir/ops/layernorm.py:39-58"]
+  M --> N["vllm_c / native / AITER / Oink local RMSNorm kernel"]
+</pre>
+
+<h3>入口代码</h3>
+<pre><code class="language-python"># vllm/distributed/communication_op.py:12-14
+def tensor_model_parallel_all_reduce(input_: torch.Tensor) -&gt; torch.Tensor:
+    """All-reduce the input tensor across model parallel group."""
+    return get_tp_group().all_reduce(input_)</code></pre>
+
+<pre><code class="language-python"># vllm/distributed/parallel_state.py:529-541
+if self.world_size == 1:
+    return input_
+
+if self.use_custom_op_call:
+    return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
+else:
+    return self._all_reduce_out_place(input_)
+
+def _all_reduce_out_place(self, input_: torch.Tensor) -&gt; torch.Tensor:
+    if self.device_communicator is None:
+        raise ValueError("No device communicator found")
+    return self.device_communicator.all_reduce(input_)</code></pre>
+
+<h2>CUDA all-reduce 后端决策</h2>
+<p><code>CudaCommunicator.__init__()</code> 只有在 group name 包含 <code>tp</code> 时才打开 custom all-reduce、Torch SymmMem 和 FlashInfer all-reduce 的开关;其它 group 会关闭这些 TP 专用路径,见 <code>cuda_communicator.py:45-59</code>。只要 world size 大于 1,它会尝试创建 <code>PyNcclCommunicator</code>,并在 symmetric memory allocator 可用时注册 NCCL symmetric memory custom op,见 <code>cuda_communicator.py:74-82</code>。</p>
+
+<pre class="mermaid">
+flowchart TD
+  A["CudaCommunicator.all_reduce(input)<br/>cuda_communicator.py:241"] --> B{"NCCL symmetric memory allowed?<br/>all_reduce_utils.py:100-134"}
+  B -- yes --> C["torch.ops.vllm.all_reduce_symmetric_with_copy<br/>pynccl.py:42-48"]
+  B -- no --> D{"QuickReduce available?<br/>quick_all_reduce.py:293-327"}
+  C --> Z["return out"]
+  D -- yes --> E["ops.qr_all_reduce"]
+  D -- no --> F{"FlashInfer all-reduce usable?<br/>flashinfer_all_reduce.py:300-330"}
+  E --> Z
+  F -- yes --> G["flashinfer_comm.allreduce_fusion(kAllReduce)"]
+  F -- no --> H{"custom all-reduce usable?<br/>custom_all_reduce.py:266-282"}
+  G --> Z
+  H -- yes --> I["ops.all_reduce custom AR"]
+  H -- no --> J{"Torch SymmMem usable?<br/>symm_mem.py:116-155"}
+  I --> Z
+  J -- yes --> K["symm_mem multimem/two_shot all_reduce"]
+  J -- no --> L{"PyNccl enabled?"}
+  K --> Z
+  L -- yes --> M["ncclAllReduce<br/>pynccl.py:166-197"]
+  L -- no --> N["torch.distributed.all_reduce fallback"]
+  M --> Z
+  N --> Z
+</pre>
+
+<table>
+<thead><tr><th>后端</th><th>触发条件/限制</th><th>实际动作</th><th>是否感知 RMSNorm</th></tr></thead>
+<tbody>
+<tr><td>NCCL symmetric memory via PyNccl</td><td><code>should_nccl_symm_mem_allreduce()</code> 要求 symmetric memory enabled、非 batch invariant、world size 达到阈值,并按 tensor size 避开 custom_AR 优势区间,见 <code>all_reduce_utils.py:100-134</code>。</td><td><code>all_reduce_symmetric_with_copy_impl()</code> 分配 symmetric input/output,复制输入,再调用 <code>pynccl_comm.all_reduce()</code>,见 <code>pynccl.py:42-48</code>。</td><td>否。只做 out-of-place all-reduce。</td></tr>
+<tr><td>QuickReduce</td><td>ROCm MI300 系列;world size 只支持 2/4/8;dtype 只支持 FP16/BF16;输入 byte size 需 16 对齐且满足 size threshold,见 <code>quick_all_reduce.py:46-73</code> 与 <code>quick_all_reduce.py:293-316</code>。</td><td>调用 <code>ops.qr_all_reduce(self._ptr, inp, out, quant_level, use_fp16_kernels)</code>,见 <code>quick_all_reduce.py:318-327</code>。</td><td>否。可用量化 codec 加速通信,不做 Norm。</td></tr>
+<tr><td>FlashInfer all-reduce communicator</td><td>需要 FlashInfer workspace;输入必须 contiguous、2D、token 数不超过 workspace 推导上限,见 <code>flashinfer_all_reduce.py:300-314</code>。</td><td>调用 <code>flashinfer_comm.allreduce_fusion(... pattern=kAllReduce)</code>,见 <code>flashinfer_all_reduce.py:316-330</code>。</td><td>否。这里 pattern 是纯 all-reduce;Norm 融合发生在编译 pass 的另一个 custom op。</td></tr>
+<tr><td>custom all-reduce</td><td><code>should_custom_ar()</code> 基于 world size、NVLink/full connected、size 上限判断;CUDA graph capture 时可用 registered buffer,见 <code>custom_all_reduce.py:240-282</code>。</td><td>调用 <code>ops.all_reduce</code>,可能先把输入复制到预注册 buffer。</td><td>否。只做通信。</td></tr>
+<tr><td>Torch SymmMem</td><td>CUDA、device capability 和 world size 在表内;dtype 固定 BF16;输入 size 不超过 symmetric buffer,见 <code>symm_mem.py:25-124</code>。</td><td>把输入复制到 symmetric buffer,调用 <code>torch.ops.symm_mem.multimem_all_reduce_</code> 或 <code>two_shot_all_reduce_</code>,再复制回 out,见 <code>symm_mem.py:126-155</code>。</td><td>否。只做通信。</td></tr>
+<tr><td>PyNccl</td><td>world size 大于 1 且 NCCL library 可用;communicator 绑定单个 device,见 <code>pynccl.py:60-145</code>。</td><td><code>PyNcclCommunicator.all_reduce()</code> 分配 out tensor 后调用 <code>ncclAllReduce</code>,见 <code>pynccl.py:166-197</code>。</td><td>否。只做 NCCL all-reduce。</td></tr>
+<tr><td>PyTorch fallback</td><td>PyNccl 不可用或返回 None 时使用。</td><td>clone 输入后调用 <code>torch.distributed.all_reduce</code>,见 <code>cuda_communicator.py:284-298</code>。</td><td>否。</td></tr>
+</tbody>
+</table>
+
+<h3>CUDA dispatch 代码片段</h3>
+<pre><code class="language-python"># vllm/distributed/device_communicators/cuda_communicator.py:241-298
+if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
+    self.pynccl_comm.world_size, input_
+):
+    out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
+    if out is not None:
+        return out
+
+if qr_comm is not None and not qr_comm.disabled \
+        and qr_comm.should_quick_allreduce(input_):
+    return qr_comm.quick_all_reduce(input_)
+
+if fi_ar_comm is not None and not fi_ar_comm.disabled \
+        and fi_ar_comm.should_use_fi_ar(input_):
+    return fi_ar_comm.all_reduce(input_)
+
+if ca_comm is not None and not ca_comm.disabled \
+        and ca_comm.should_custom_ar(input_):
+    return ca_comm.custom_all_reduce(input_)
+
+if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
+    return symm_mem_comm.all_reduce(input_)
+
+out = pynccl_comm.all_reduce(input_)
+if out is None:
+    out = input_.clone()
+    torch.distributed.all_reduce(out, group=self.device_group)
+return out</code></pre>
+
+<h2>RMSNorm 实现</h2>
+<p><code>RMSNorm</code> 是 <code>CustomOp</code>,语义是 <code>x -&gt; w * x / sqrt(E[x^2] + eps)</code>,见 <code>model_executor/layers/layernorm.py:36-43</code>。构造时它根据 IR op priority 和 <code>variance_size_override</code> 判断 native 路径是否需要传 weight,见 <code>layernorm.py:47-80</code>。CUDA forward 在 batch invariant 且无 residual 时可走 <code>rms_norm_batch_invariant</code>,否则回到 <code>forward_native()</code>,见 <code>layernorm.py:104-116</code>。</p>
+
+<pre><code class="language-python"># vllm/model_executor/layers/layernorm.py:82-102
+def forward_native(
+    self,
+    x: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -&gt; torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if residual is None:
+        return ir.ops.rms_norm(
+            x,
+            self.weight.data if self.pass_weight else None,
+            self.variance_epsilon,
+            self.variance_size_override,
+        )
+    else:
+        return ir.ops.fused_add_rms_norm.maybe_inplace(
+            x,
+            residual,
+            self.weight.data if self.pass_weight_add else None,
+            self.variance_epsilon,
+            self.variance_size_override,
+        )</code></pre>
+
+<p>IR reference 实现说明了两个核心语义:</p>
+<ul>
+  <li><code>rms_norm</code>:把输入转 FP32,沿最后一维算 <code>mean(x^2)</code>,乘 <code>rsqrt(variance + epsilon)</code>,再乘 weight 并转回原 dtype,见 <code>ir/ops/layernorm.py:9-21</code>。</li>
+  <li><code>fused_add_rms_norm</code>:先把 <code>x + x_residual</code> 以 FP32 相加,把相加结果写回 residual 的原 dtype 表示,再对相加后的值做 RMSNorm,见 <code>ir/ops/layernorm.py:39-58</code>。</li>
+</ul>
+
+<p>CUDA-like 默认实现由平台决定。CUDA 平台在 Inductor 编译时默认优先 native,非 codegen 时默认 <code>["vllm_c", "native"]</code>;如果启用 Oink,会把 Oink 放到 RMSNorm priority 前面,见 <code>platforms/cuda.py:574-593</code>。ROCm 在满足 CUDA Graph 和 AITER env 时可把 AITER 放到 RMSNorm priority 前面,见 <code>platforms/rocm.py:936-962</code>。</p>
+
+<table>
+<thead><tr><th>RMSNorm 实现层</th><th>源码事实</th><th>通信关系</th></tr></thead>
+<tbody>
+<tr><td>IR native</td><td><code>ir.ops.rms_norm</code> 和 <code>ir.ops.fused_add_rms_norm</code> 给出 PyTorch reference 语义,见 <code>ir/ops/layernorm.py:9-58</code>。</td><td>无通信。</td></tr>
+<tr><td>vLLM C kernel</td><td><code>vllm/kernels/vllm_c.py</code> 注册 <code>vllm_c</code> 实现;无 residual 时调用 <code>torch.ops._C.rms_norm</code>,有 residual 时调用 <code>torch.ops._C.fused_add_rms_norm</code>,见 <code>kernels/vllm_c.py:22-90</code>。</td><td>无通信。只在本 rank 的 tensor 上做 Norm。</td></tr>
+<tr><td>CUDA C++/stable ABI</td><td><code>csrc/libtorch_stable/layernorm_kernels.cu</code> 中 <code>rms_norm()</code> launch <code>rms_norm_kernel</code>,<code>fused_add_rms_norm()</code> launch <code>fused_add_rms_norm_kernel</code>,见 <code>layernorm_kernels.cu:193-239</code> 与 <code>layernorm_kernels.cu:241-275</code>。</td><td>无通信。</td></tr>
+<tr><td>AITER / Oink</td><td>AITER 和 Oink 分别注册 RMSNorm/fused add RMSNorm 的 IR impl,见 <code>kernels/aiter_ops.py:42-143</code> 与 <code>kernels/oink_ops.py:76-126</code>。</td><td>普通 RMSNorm impl 无通信;AITER 另有编译期 fused allreduce-rmsnorm custom op。</td></tr>
+</tbody>
+</table>
+
+<h2>通信-计算融合:三种层级</h2>
+<p>“有无融合”在 vLLM 里要分层回答。普通 communicator 不融合 Norm;RMSNorm 层融合 residual add;编译 pass 可以把通信和 Norm 合成一个外部 fused op。</p>
+
+<pre class="mermaid">
+flowchart TD
+  A["模型图中出现<br/>TP all_reduce -> RMSNorm 或 fused_add_rms_norm"] --> B{"Inductor 编译 pass 开启?"}
+  B -- no --> C["普通 eager/graph 路径:<br/>all_reduce 后端只通信,再本地 RMSNorm"]
+  B -- yes --> D{"enable_sp?"}
+  D -- yes --> E["SequenceParallelismPass:<br/>ReduceScatter -> local RMSNorm -> AllGather<br/>sequence_parallelism.py:495-512"]
+  D -- no --> F{"fuse_allreduce_rms?"}
+  F -- no --> C
+  F -- yes --> G{"ROCm AITER enabled?"}
+  G -- yes --> H["RocmAiterAllReduceFusionPass:<br/>rocm_aiter_fused_allreduce_rmsnorm<br/>allreduce_rms_fusion.py:1005-1085"]
+  G -- no --> I{"FlashInfer comm installed + workspace + size OK?"}
+  I -- yes --> J["AllReduceFusionPass:<br/>flashinfer_trtllm_fused_allreduce_norm<br/>allreduce_rms_fusion.py:761-895"]
+  I -- no --> C
+</pre>
+
+<h3>1. 普通 eager 路径:无通信+Norm 一体化</h3>
+<p>这条路径最容易从文件边界看清楚:<code>communication_op.py</code> 不知道 residual 或 RMSNorm;<code>cuda_communicator.py</code> 的所有分支都只返回 all-reduced tensor;<code>layernorm.py</code> 只在拿到 tensor 后做本地 Norm。也就是说,如果没有编译期 fusion pass,一次典型的 TP 输出后处理是:</p>
+
+<pre><code>local matmul output
+  -> tensor_model_parallel_all_reduce(output_parallel)
+  -> materialized all-reduced tensor
+  -> RMSNorm.forward(x, residual)
+  -> ir.ops.fused_add_rms_norm(x, residual, weight, eps)
+  -> local norm output + updated residual</code></pre>
+
+<h3>2. SequenceParallelismPass:通信分解,不是单 kernel 融合</h3>
+<p><code>SequenceParallelismPass</code> 明确说它识别 <code>AllReduce</code> 后接 <code>RMSNorm</code> 或 <code>RMSNorm+Quantization</code>,并替换为 <code>ReduceScatter</code>、local RMSNorm/Quantization、<code>AllGather</code>,见 <code>sequence_parallelism.py:495-507</code>。源码注释还写明这个 pass 本身不直接带来性能收益,而是为后续 <code>GEMM + ReduceScatter</code> 和 <code>AllGather + GEMM</code> 融合铺路,见 <code>sequence_parallelism.py:508-512</code>。</p>
+<p>它支持无 residual 的 first-layer pattern,见 <code>sequence_parallelism.py:150-180</code>;也支持带 residual 的 middle-layer pattern,即 <code>all_reduce(mm_1)</code> 后接 <code>fused_add_rms_norm(all_reduce, residual, weight)</code>,再改写为 <code>reduce_scatter(mm_1)</code>、local <code>fused_add_rms_norm</code> 和 <code>all_gather</code>,见 <code>sequence_parallelism.py:183-257</code>。这不是 HPC-Ops 题述的一体化 AllReduce+Norm kernel,但它把 Norm 的计算粒度从完整 sequence 改到本地 shard。</p>
+
+<h3>3. AllReduceFusionPass:FlashInfer fused allreduce-norm</h3>
+<p>这是当前源码里最接近 HPC-Ops 题述方案的 CUDA 路径。文件开头在 FlashInfer 可用且包含 <code>allreduce_fusion</code> 与 <code>create_allreduce_fusion_workspace</code> 时注册 custom op <code>flashinfer_trtllm_fused_allreduce_norm</code>,见 <code>allreduce_rms_fusion.py:53-63</code> 与 <code>allreduce_rms_fusion.py:121-245</code>。这个 custom op 调用 <code>flashinfer_comm.allreduce_fusion()</code>,传入 <code>input</code>、workspace、<code>residual_in</code>、<code>residual_out</code>、<code>norm_out</code>、<code>rms_gamma</code>、<code>rms_eps</code>、可选 quant 输出和 scale,见 <code>allreduce_rms_fusion.py:194-212</code>。</p>
+
+<pre><code class="language-python"># vllm/compilation/passes/fusion/allreduce_rms_fusion.py:374-400
+def pattern(residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor):
+    allreduce_output = tensor_model_parallel_all_reduce(input)
+    rms, residual = vllm.ir.ops.fused_add_rms_norm(
+        allreduce_output, residual, weight, self.epsilon
+    )
+    return rms, residual
+
+def replacement(residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor):
+    allreduce = auto_functionalized(
+        flashinfer_trtllm_fused_allreduce_norm,
+        allreduce_in=input,
+        residual=residual,
+        norm_out=None,
+        quant_out=None,
+        scale_out=None,
+        rms_gamma=weight,
+        rms_eps=self.epsilon,
+        pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        **self.allreduce_params.get_trtllm_fused_allreduce_kwargs(),
+    )
+    return allreduce[1], allreduce[2]</code></pre>
+
+<p><code>AllReduceFusionPass</code> 的启用条件也很明确:</p>
+<ul>
+  <li>TP size 必须大于 1,否则禁用,见 <code>allreduce_rms_fusion.py:761-768</code>。</li>
+  <li>必须有 <code>model_config</code>,需要 hidden size 推导 workspace token 上限,见 <code>allreduce_rms_fusion.py:772-803</code>。</li>
+  <li>FlashInfer comm 模块必须存在,否则跳过,见 <code>allreduce_rms_fusion.py:780-785</code>。</li>
+  <li>当前 world size 必须有 fusion max size,见 <code>allreduce_rms_fusion.py:786-796</code>。</li>
+  <li>FlashInfer allreduce workspace 初始化失败会禁用 allreduce-norm fusion,见 <code>allreduce_rms_fusion.py:811-824</code>。</li>
+  <li>编译 range 的 token 数必须不超过 <code>max_token_num</code>,见 <code>allreduce_rms_fusion.py:891-895</code>。</li>
+</ul>
+<p>pattern 覆盖范围包括:all-reduce + RMSNorm、all-reduce + fused add RMSNorm、all-reduce + RMSNorm + static FP8 quant、all-reduce + fused add RMSNorm + static FP8 quant,以及 Blackwell capability 100 上的 NVFP4 quant pattern,见 <code>allreduce_rms_fusion.py:285-758</code> 与 <code>allreduce_rms_fusion.py:843-889</code>。</p>
+
+<h3>4. ROCm AITER fused allreduce-rmsnorm</h3>
+<p>ROCm 路径在 pass manager 中优先使用 <code>RocmAiterAllReduceFusionPass</code>:当 <code>pass_config.fuse_allreduce_rms</code> 为真且 AITER 启用时加入 AITER pass,否则加入 FlashInfer pass,见 <code>compilation/passes/pass_manager.py:151-155</code>。AITER replacement 对无 residual 和有 residual 的模式都调用 <code>rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()</code>,见 <code>allreduce_rms_fusion.py:913-1000</code>。</p>
+<p>底层 custom op <code>_rocm_aiter_fused_allreduce_rmsnorm_impl()</code> 根据 input dtype、hidden dim、token 数、world size 和是否 full NVLink 决定是否使用 1-stage path,然后调用 <code>aiter_ar.fused_ar_rms(input_, residual, w=weight, eps=epsilon, ...)</code>,见 <code>vllm/_aiter_ops.py:750-791</code>。AITER pass 还要求 TP size 大于 1、存在 device communicator 和 custom all-reduce,并初始化 AITER allreduce,见 <code>allreduce_rms_fusion.py:1005-1035</code>。旧版 AITER 对 hidden dim 还有 512/1024/2048/4096 的限制检测,见 <code>allreduce_rms_fusion.py:1042-1066</code>。</p>
+
+<h2>和 HPC-Ops Fused AllReduce+Norm 对比</h2>
+<table>
+<thead><tr><th>维度</th><th>HPC-Ops 题述一体化方案</th><th>vLLM 普通路径</th><th>vLLM 可选融合路径</th></tr></thead>
+<tbody>
+<tr><td>融合范围</td><td>TP all-reduce + residual add + RMSNorm 一体化。</td><td>all-reduce 与 RMSNorm 分离;RMSNorm 内部可融合 residual add,见 <code>layernorm.py:82-102</code>。</td><td>FlashInfer/AITER 编译 pass 可把 <code>all_reduce + fused_add_rms_norm</code> 替换成 fused allreduce-norm op,见 <code>allreduce_rms_fusion.py:347-400</code> 与 <code>allreduce_rms_fusion.py:959-1000</code>。</td></tr>
+<tr><td>入口 API</td><td>题述上像一个专门 fused op 或 kernel。</td><td><code>tensor_model_parallel_all_reduce(input_)</code> 只有 input tensor 参数,见 <code>communication_op.py:12-14</code>。</td><td>用户模型代码仍写普通 all-reduce/RMSNorm;FX/Inductor pass 做 pattern replacement。</td></tr>
+<tr><td>通信后端</td><td>题述未给后端细节。</td><td>CUDA communicator 按 NCCL symmetric memory、QuickReduce、FlashInfer pure AR、custom AR、Torch SymmMem、PyNccl、PyTorch fallback 选择,见 <code>cuda_communicator.py:241-298</code>。</td><td>FlashInfer fused allreduce-norm 使用 FlashInfer comm workspace;ROCm 使用 AITER allreduce。它们不走普通 communicator 的 residual-blind dispatch。</td></tr>
+<tr><td>残差处理</td><td>residual add 是融合 kernel 的一部分。</td><td><code>ir.ops.fused_add_rms_norm</code> 在本 rank 上先做 <code>x + residual</code> 并更新 residual,见 <code>ir/ops/layernorm.py:39-58</code>。</td><td>FlashInfer fused op 接收 <code>residual_in</code>/<code>residual_out</code>;AITER fused op 接收 <code>input_</code>/<code>residual</code>,见 <code>allreduce_rms_fusion.py:194-212</code> 与 <code>_aiter_ops.py:782-789</code>。</td></tr>
+<tr><td>RMSNorm 计算</td><td>与通信同一体化调度。</td><td>IR reference 用 FP32 计算方差;具体实现可落到 native、vllm_c、AITER、Oink,见 <code>ir/ops/layernorm.py:9-58</code> 与 <code>kernels/vllm_c.py:22-90</code>。</td><td>FlashInfer pattern code 使用 <code>kARResidualRMSNorm</code>;AITER 调 <code>fused_ar_rms</code>。</td></tr>
+<tr><td>是否支持 Norm 后量化</td><td>题述只说 AllReduce+Norm,未确认量化。</td><td>RMSNorm quant fusion 是另一类本地 pass,不属于普通 all-reduce。</td><td>FlashInfer pass 支持 FP8 和 NVFP4 static quant pattern,见 <code>allreduce_rms_fusion.py:419-758</code>。</td></tr>
+<tr><td>适用范围</td><td>题述未给限制。</td><td>所有普通 TP 路径都可走,后端自动 fallback。</td><td>需要编译 pass、TP size 大于 1、FlashInfer/AITER 可用、workspace 初始化成功、token 数在上限内;AITER 还有 dtype/hidden/token/world size 等 runtime 条件。</td></tr>
+<tr><td>源码可确认结论</td><td>只能确认题述目标,不能确认具体实现。</td><td>确认不是一体化方案。</td><td>确认存在近似一体化的可选实现,但不是默认通信 API 的通用行为。</td></tr>
+</tbody>
+</table>
+
+<h2>常见误读</h2>
+<table>
+<thead><tr><th>说法</th><th>判断</th><th>源码依据</th></tr></thead>
+<tbody>
+<tr><td><code>pynccl.py</code> 已经做了 AllReduce+Norm fusion。</td><td><span class="warn">不准确</span>。PyNccl 只封装 NCCL all-reduce;NCCL symmetric memory wrapper 也只是 copy 到 symmetric memory 后 all-reduce。</td><td><code>pynccl.py:42-48</code>, <code>pynccl.py:166-197</code></td></tr>
+<tr><td><code>symm_mem.py</code> 是 fused residual RMSNorm。</td><td><span class="warn">不准确</span>。Torch SymmMem path 只把输入复制到 symmetric buffer 并执行 multimem/two-shot all-reduce。</td><td><code>symm_mem.py:126-155</code></td></tr>
+<tr><td><code>quick_all_reduce.py</code> 是通信计算融合。</td><td><span class="warn">不准确</span>。QuickReduce 可做通信量化 codec,但输出仍是 all-reduced tensor,没有 residual/weight/epsilon 参数。</td><td><code>quick_all_reduce.py:318-327</code></td></tr>
+<tr><td>vLLM 完全没有 AllReduce+Norm fusion。</td><td><span class="warn">也不准确</span>。编译期确实有 FlashInfer 和 AITER 的 allreduce-rmsnorm pattern fusion。</td><td><code>pass_manager.py:151-155</code>, <code>allreduce_rms_fusion.py:761-895</code>, <code>allreduce_rms_fusion.py:1005-1085</code></td></tr>
+<tr><td><code>SequenceParallelismPass</code> 就是 AllReduce+Norm fused kernel。</td><td><span class="warn">不准确</span>。它把 all-reduce 分解成 reduce-scatter + local norm + all-gather,并声明主要为后续 GEMM+通信融合铺路。</td><td><code>sequence_parallelism.py:495-512</code></td></tr>
+<tr><td><code>RMSNorm.forward(residual)</code> 融合了 residual add。</td><td><span class="ok">准确</span>。有 residual 时调用 <code>ir.ops.fused_add_rms_norm.maybe_inplace</code>,可落到本地 fused add RMSNorm kernel。</td><td><code>layernorm.py:95-102</code>, <code>kernels/vllm_c.py:54-90</code></td></tr>
+</tbody>
+</table>
+
+<h2>最小调用链</h2>
+<pre><code>普通 eager 路径:
+RowParallelLinear.forward()
+  -> tensor_model_parallel_all_reduce(output_parallel)
+     communication_op.py:12-14
+  -> GroupCoordinator.all_reduce()
+     parallel_state.py:514-541
+  -> CudaCommunicator.all_reduce()
+     cuda_communicator.py:241-298
+  -> one of:
+     all_reduce_symmetric_with_copy / QuickReduce / FlashInfer pure AR /
+     custom AR / Torch SymmMem / PyNccl / torch.distributed fallback
+  -> model layer calls RMSNorm(..., residual)
+     llama.py:320-333, qwen2.py:296-312
+  -> ir.ops.fused_add_rms_norm
+     layernorm.py:82-102, ir/ops/layernorm.py:39-58
+  -> local RMSNorm implementation
+     kernels/vllm_c.py:54-90
+
+FlashInfer 编译融合路径:
+model graph pattern:
+  tensor_model_parallel_all_reduce(input)
+  -> ir.ops.fused_add_rms_norm(allreduce_output, residual, weight, eps)
+replacement:
+  flashinfer_trtllm_fused_allreduce_norm(
+      allreduce_in=input,
+      residual=residual,
+      rms_gamma=weight,
+      rms_eps=eps,
+      pattern_code=kARResidualRMSNorm,
+  )
+evidence:
+  allreduce_rms_fusion.py:121-245, 347-400, 761-895
+
+ROCm AITER 编译融合路径:
+model graph pattern:
+  tensor_model_parallel_all_reduce(input)
+  -> ir.ops.fused_add_rms_norm(allreduce_output, residual, weight, eps)
+replacement:
+  rocm_aiter_fused_allreduce_rmsnorm(input_, residual, weight, epsilon)
+  -> aiter_ar.fused_ar_rms(...)
+evidence:
+  allreduce_rms_fusion.py:913-1085, _aiter_ops.py:750-791</code></pre>
+
+<h2>阅读结论</h2>
+<ul>
+  <li><span class="ok">确认:</span> <code>distributed/communication_op.py</code> 是很薄的 TP collective facade。它不包含 residual、RMSNorm 或 fusion 策略。</li>
+  <li><span class="ok">确认:</span> <code>device_communicators/pynccl.py</code>、<code>symm_mem.py</code>、<code>quick_all_reduce.py</code> 都是 all-reduce 通信后端或通信加速后端,不是 Norm 后端。</li>
+  <li><span class="ok">确认:</span> vLLM 的 RMSNorm 本身有清晰的本地计算融合:有 residual 时走 <code>fused_add_rms_norm</code>,语义是 residual add 后 RMSNorm。</li>
+  <li><span class="ok">确认:</span> 当前工作树存在通信+Norm 的可选编译期融合,包括 FlashInfer <code>flashinfer_trtllm_fused_allreduce_norm</code> 和 ROCm AITER <code>rocm_aiter_fused_allreduce_rmsnorm</code>。</li>
+  <li><span class="warn">边界:</span> 这些融合不是普通 all-reduce API 的默认行为。没有触发编译 pass 或后端条件不满足时,vLLM 回到 “通信先完成,再本地 residual+RMSNorm” 的分层路径。</li>
+  <li><span class="ok">对照结论:</span> 如果 HPC-Ops 的 Fused AllReduce+Norm 指的是“把 TP 通信、残差加法和 RMSNorm 放进一个一体化 kernel/调度单元”,vLLM 当前不是单一全局方案。它的普通路径是模块化分层;它的可选 FlashInfer/AITER pass 在满足条件时能达到相近的 fused allreduce-norm 形态;Sequence Parallelism 则是另一种把 all-reduce+norm 改写为 reduce-scatter/local norm/all-gather 的通信分解路线。</li>
+</ul>
+</body>
+</html>

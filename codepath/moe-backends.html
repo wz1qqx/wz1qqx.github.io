@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM MoE backend 数据流与 dispatch 学习笔记</title>
+<style>
+body{font:14px/1.65 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1120px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+h1,h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em}
+h2{margin-top:2rem}
+h3{margin-top:1.4rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;overflow:auto}
+pre code{background:transparent;padding:0}
+pre.mermaid{background:#fff;border:1px solid #d0d7de;border-radius:6px;padding:16px}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.lead{color:#57606a;font-size:15px}
+.meta{color:#57606a;font-size:12px}
+.ok{color:#0a7d20;font-weight:600}
+.warn{color:#b35900;font-weight:600}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da}
+.box{border-left:4px solid #0969da;background:#f6f8fa;padding:8px 12px;margin:12px 0}
+.small{font-size:12px;color:#57606a}
+nav a{margin-right:1rem}
+</style>
+</head>
+<body>
+<nav><a href="overview.html">&larr; overview</a><a href="index.html">codepath map</a><a href="humming-kernel.html">humming note</a><a href="marlin-kernel.html">marlin note</a></nav>
+
+<h1>vLLM MoE backend 数据流与 dispatch 学习笔记</h1>
+<p class="lead">结论先行:当前工作树的 MoE 不是一个单独 kernel,而是一条由 <code>FusedMoE</code>、<code>MoERunner</code>、router、quant method、oracle selector、prepare/finalize 和 expert GEMM backend 组合出来的流水线。<code>--moe-backend auto</code> 也不是全局唯一优先级,而是每个量化族分别定义候选顺序,再逐个调用 expert class 的 <code>is_supported_config()</code> 做设备、量化、activation、parallel、routing 和 shape 检查。</p>
+<p class="meta">源码基准:<code>/Users/f/Documents/vllm-workspace/tasks/opt-kimi-pd/vllm-int</code> 当前工作树。本文只依据本地源码行号;不引用 benchmark 结果,也不推断外部库内部实现。</p>
+
+<h2>阅读结论</h2>
+<table>
+<thead><tr><th>问题</th><th>源码事实</th></tr></thead>
+<tbody>
+<tr><td>MoE 数据流主干</td><td><code>FusedMoE.forward()</code> 只委托给 <code>MoERunner.forward()</code>; runner 进入 custom op 后在 <code>_forward_impl()</code> 里做可选 gate、dispatch/combine、router top-k、quant method apply、shared expert 合并和最终 reduce。关键行:<code>fused_moe/layer.py:1306-1316</code>, <code>runner/moe_runner.py:592-678</code>, <code>runner/moe_runner.py:742-799</code>。</td></tr>
+<tr><td>router/gating 到 expert 选择</td><td>router 由 <code>create_fused_moe_router()</code> 创建,优先级是 routing simulator、zero expert、grouped top-k、custom routing、bias/hash top-k、AITER shared routed、默认 fused top-k。公共 <code>select_experts()</code> 返回 <code>topk_weights</code> 与 <code>topk_ids</code>,并可做 EPLB 映射。关键行:<code>router/router_factory.py:63-75</code>, <code>router/router_factory.py:113-222</code>, <code>router/base_router.py:250-298</code>。</td></tr>
+<tr><td>expert GEMM 和 combine</td><td>modular MoE 抽象把流程拆成 <code>[Router] -&gt; [Quantize-Dispatch] -&gt; [Permute-Experts-Unpermute] -&gt; [Combine]</code>。expert class 负责两段 GEMM: <code>w13</code> gate/up GEMM、activation/必要量化、<code>w2</code> down GEMM; prepare/finalize 负责输入量化、All2All/dispatch、top-k 权重和 reduce。关键行:<code>modular_kernel.py:46-80</code>, <code>modular_kernel.py:1116-1202</code>, <code>modular_kernel.py:1204-1283</code>, <code>modular_kernel.py:1285-1351</code>。</td></tr>
+<tr><td>backend 选择</td><td><code>FusedMoEConfig.moe_backend</code> 来自 <code>vllm_config.kernel_config.moe_backend</code>,但真正 selector 在各 quant family 的 oracle 里: unquantized、FP8、MXFP4、MXFP8、NVFP4、INT8、WNA16、W4A8。每个 selector 都有自己的显式 map 和 auto priority。关键行:<code>fused_moe/layer.py:318-341</code>, <code>oracle/*.py</code>。</td></tr>
+<tr><td>通用支持判定</td><td>所有 modular/monolithic expert class 都要经过 <code>FusedMoEExperts.is_supported_config()</code>,检查当前设备、是否支持非 gated MLP、activation、量化 scheme、parallel config、routing method、router logits dtype、hidden dim、activation format、batch invariance 和 LoRA。关键行:<code>fused_moe/modular_kernel.py:536-582</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>关键文件地图</h2>
+<table>
+<thead><tr><th>文件</th><th>关键行</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td><code>vllm/config/kernel.py</code></td><td><code>122-137</code>, <code>171-190</code>, <code>211-216</code></td><td>声明配置层可见的 <code>MoEBackend</code> 字符串,描述每个 backend,并把用户输入规范化为小写加下划线。</td></tr>
+<tr><td><code>vllm/model_executor/layers/fused_moe/layer.py</code></td><td><code>296-315</code>, <code>318-341</code>, <code>351-369</code>, <code>419-444</code>, <code>453-479</code>, <code>1293-1316</code></td><td>构造 router、<code>FusedMoEConfig</code>、quant method、权重和 runner;加载后可把旧 quant method 包装成 modular kernel; forward 入口委托 runner。</td></tr>
+<tr><td><code>fused_moe/runner/moe_runner.py</code></td><td><code>90-105</code>, <code>167-181</code>, <code>496-537</code>, <code>592-678</code>, <code>686-740</code>, <code>742-799</code></td><td>MoE forward 编排层:custom op、shared expert overlap、top-k routing、quant method apply、DP/EP naive dispatch/combine、输出合并。</td></tr>
+<tr><td><code>fused_moe/router/*.py</code></td><td><code>router_factory.py:63-75</code>, <code>base_router.py:250-298</code>, <code>fused_topk_router.py:69-113</code>, <code>grouped_topk_router.py:84-165</code></td><td>router 工厂、公共 select 模板、默认 fused top-k、DeepSeek 系列 grouped top-k。</td></tr>
+<tr><td><code>fused_moe/modular_kernel.py</code></td><td><code>46-94</code>, <code>536-582</code>, <code>1116-1351</code>, <code>1507-1660</code></td><td>modular MoE 架构:prepare/finalize、expert GEMM、monolithic/modular kernel 封装、支持性检查。</td></tr>
+<tr><td><code>fused_moe/oracle/*.py</code></td><td>各文件开头的 enum/map/select/make</td><td>按量化族选择 expert backend,并做权重格式转换和 <code>FusedMoEKernel</code> 创建。</td></tr>
+<tr><td><code>fused_moe/experts/*.py</code></td><td>每个 backend class 的 <code>_supports_*</code> 与 <code>apply()</code></td><td>真正的 expert GEMM 后端适配层:两段 GEMM、activation、workspace、top-k 权重和 reduction 位置。</td></tr>
+</tbody>
+</table>
+
+<h2>端到端数据流</h2>
+<pre class="mermaid">
+flowchart TD
+  A["Transformer layer MoE FFN"] --> B["FusedMoE.forward<br/>layer.py:1306-1316"]
+  B --> C["MoERunner.forward<br/>moe_runner.py:592-642"]
+  C --> D["torch.ops.vllm.moe_forward / moe_forward_shared<br/>moe_runner.py:90-105,167-181"]
+  D --> E["_forward_impl<br/>moe_runner.py:742-799"]
+  E --> F["ensure_moe_quant_config_init<br/>layer.py:1293-1304"]
+  F --> G{"runner owns gate?"}
+  G -- yes --> H["F.linear / gate(hidden_states)<br/>moe_runner.py:771-776"]
+  G -- no --> I["use provided router_logits"]
+  H --> J["_maybe_dispatch DP/EP/PCP<br/>moe_runner.py:686-718"]
+  I --> J
+  J --> K{"quant method monolithic?"}
+  K -- yes --> L["apply_monolithic: backend owns routing + experts<br/>moe_runner.py:514-520"]
+  K -- no --> M["router.select_experts<br/>moe_runner.py:522-526"]
+  M --> N["topk_weights + topk_ids<br/>router/base_router.py:250-298"]
+  N --> O["quant_method.apply<br/>moe_runner.py:530-537"]
+  O --> P["FusedMoEKernel.prepare: quantize/dispatch<br/>modular_kernel.py:1116-1202"]
+  P --> Q["experts.apply: w13 GEMM -> activation/quant -> w2 GEMM<br/>modular_kernel.py:1204-1283"]
+  Q --> R["finalize/combine: top-k weights, unpermute, reduce<br/>modular_kernel.py:1285-1351"]
+  L --> S["_maybe_combine + shared expert add/reduce/truncate<br/>moe_runner.py:653-678,720-740"]
+  R --> S
+  S --> T["new hidden_states"]
+</pre>
+
+<h3>逐段说明</h3>
+<table>
+<thead><tr><th>阶段</th><th>输入/输出</th><th>关键代码</th></tr></thead>
+<tbody>
+<tr><td>Layer 初始化</td><td>模型参数、并行配置、量化配置进入 <code>FusedMoE</code>。输出是 router、<code>FusedMoEConfig</code>、quant method、runner。</td><td><code>layer.py:296-315</code> 创建 router;<code>layer.py:318-341</code> 写入 <code>moe_backend</code>;<code>layer.py:351-369</code> 选择 quant method 或 unquantized method;<code>layer.py:419-444</code> 创建权重和 runner。</td></tr>
+<tr><td>Forward 入口</td><td><code>hidden_states</code> 与 <code>router_logits</code> 进入 runner。runner 先处理 routed input transform 和 hidden size padding。</td><td><code>layer.py:1306-1316</code>, <code>moe_runner.py:592-642</code>。</td></tr>
+<tr><td>可选 gate</td><td>部分 runner 持有 gate 时,会在 <code>_forward_impl()</code> 里用当前 hidden states 重新计算 <code>router_logits</code>。</td><td><code>moe_runner.py:768-776</code>。</td></tr>
+<tr><td>dispatch</td><td>DP/EP naive 模式会把 hidden states 和 router logits dispatch 到专家所在 rank; PCP 会 all-gather。</td><td><code>moe_runner.py:686-718</code>。</td></tr>
+<tr><td>expert selection</td><td>非 monolithic backend 先调用 router 产生 <code>topk_weights</code> 和 <code>topk_ids</code>; monolithic backend 可以直接吃 <code>router_logits</code>。</td><td><code>moe_runner.py:514-537</code>, <code>router/base_router.py:250-298</code>。</td></tr>
+<tr><td>expert GEMM</td><td>quant method 或 modular kernel 使用 <code>w13_weight</code>/<code>w2_weight</code> 做两段 expert GEMM,中间执行 activation 和必要的 activation quant。</td><td><code>fused_moe_modular_method.py:89-111</code>, <code>modular_kernel.py:1204-1283</code>。</td></tr>
+<tr><td>finalize / combine</td><td>按 top-k 权重合并专家输出,必要时 unpermute、reduce-scatter/all-reduce;最后与 shared expert 输出相加并处理 zero expert。</td><td><code>modular_kernel.py:1285-1351</code>, <code>moe_runner.py:653-678</code>, <code>moe_runner.py:720-740</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>Router 与 gating</h2>
+<p>router 的选择与 expert GEMM backend 是两层逻辑。router 只负责把 token 映射到专家,输出 <code>topk_weights</code> 和 <code>topk_ids</code>;后端 selector 负责决定这些 token/expert 元数据交给哪种 expert GEMM 实现。</p>
+
+<pre class="mermaid">
+flowchart TD
+  A["create_fused_moe_router<br/>router_factory.py:39-62"] --> B{"VLLM_MOE_ROUTING_SIMULATION_STRATEGY set?"}
+  B -- yes --> C["RoutingSimulatorRouter"]
+  B -- no --> D{"zero_expert_type?"}
+  D -- yes --> E["ZeroExpertRouter"]
+  D -- no --> F{"use_grouped_topk?"}
+  F -- yes --> G["GroupedTopKRouter<br/>DeepSeek-V2/V3 style"]
+  F -- no --> H{"custom_routing_function?"}
+  H -- yes --> I["CustomRoutingRouter"]
+  H -- no --> J{"e_score_correction_bias or hash_indices_table?"}
+  J -- yes --> K["FusedTopKBiasRouter<br/>bias/hash/sqrtsoftplus variants"]
+  J -- no --> L{"AITER fused shared routed?"}
+  L -- yes --> M["AiterSharedRoutedFusedMoERouter"]
+  L -- no --> N["FusedTopKRouter<br/>default"]
+</pre>
+
+<table>
+<thead><tr><th>router 路径</th><th>源码依据</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>默认 fused top-k</td><td><code>fused_topk_router.py:69-113</code>, <code>fused_topk_router.py:147-165</code></td><td>分配 <code>topk_weights</code>/<code>topk_ids</code>,按 <code>softmax</code> 或 <code>sigmoid</code> 调 <code>ops.topk_softmax</code>/<code>ops.topk_sigmoid</code>;ROCm AITER 可替换 top-k op。</td></tr>
+<tr><td>grouped top-k</td><td><code>grouped_topk_router.py:84-165</code></td><td>用于 DeepSeek-V2/V3 一类分组专家路由。满足 env、CUDA、group/top-k 规模和 bias 条件时走 fused grouped top-k;否则用 PyTorch 计算 group score、mask、top-k 和 renormalize。</td></tr>
+<tr><td>公共 select 模板</td><td><code>base_router.py:250-298</code></td><td>统一做 EPLB state 校验、indices dtype 获取、调用子类 <code>_compute_routing()</code>、捕获 logical ids、EPLB mapping 和 dtype 转换。</td></tr>
+<tr><td>DeepSeek V4 hash/sqrtsoftplus</td><td><code>router_factory.py:185-198</code></td><td>当存在 correction bias 或 hash indices table 时选择 <code>FusedTopKBiasRouter</code>;DeepSeek V4 MegaMoE 还要求 <code>sqrtsoftplus</code> routing,见 <code>vllm/models/deepseek_v4/nvidia/model.py:647-650</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>Expert GEMM 与合并输出</h2>
+<p>MoE expert GEMM 的共同形态是两段矩阵乘:第一段 <code>w13</code> 计算 gate/up projection,中间 activation 或 activation+quant,第二段 <code>w2</code> 计算 down projection。不同 backend 的差异主要在于 token 如何 permute/dispatch、activation 是否预量化、GEMM kernel 来自 Triton/CUTLASS/FlashInfer/DeepGEMM/Marlin/Humming/AITER,以及 top-k 权重乘法和 reduction 是在 expert kernel 内还是 finalize 阶段完成。</p>
+
+<pre class="mermaid">
+flowchart LR
+  A["hidden_states"] --> B["prepare<br/>input quant + dispatch + token/expert metadata"]
+  B --> C["w13 expert GEMM<br/>gate/up"]
+  C --> D["MoE activation<br/>SwiGLU/GELU/etc"]
+  D --> E{"backend needs activation quant?"}
+  E -- yes --> F["quantize activation<br/>FP8/INT8/FP4 scale"]
+  E -- no --> G["keep BF16/FP16/FP32 activation"]
+  F --> H["w2 expert GEMM<br/>down"]
+  G --> H
+  H --> I["top-k weight + reduce<br/>inside experts or finalize"]
+  I --> J["unpermute/combine/all-reduce"]
+</pre>
+
+<table>
+<thead><tr><th>抽象层</th><th>源码</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td><code>FusedMoEPrepareAndFinalizeModular</code></td><td><code>modular_kernel.py:60-65</code>, <code>modular_kernel.py:1116-1202</code>, <code>modular_kernel.py:1285-1351</code></td><td>prepare 处理输入量化、dispatch、expert token metadata;finalize 处理 top-k 权重、输出 reduce/unpermute/combine。</td></tr>
+<tr><td><code>FusedMoEExpertsModular</code></td><td><code>modular_kernel.py:66-70</code>, <code>modular_kernel.py:1204-1283</code></td><td>具体 expert compute: matmul + activation + optional quant + matmul。它通过 <code>finalize_weight_and_reduce_impl()</code> 告诉 finalize 自己是否已经处理 top-k 权重和 reduce。</td></tr>
+<tr><td><code>FusedMoEKernel</code></td><td><code>modular_kernel.py:1507-1543</code>, <code>modular_kernel.py:1601-1660</code></td><td>把 prepare/finalize 与 experts 组装成 modular 或 monolithic kernel。两者必须同为 modular 或同为 monolithic,否则直接报错。</td></tr>
+<tr><td><code>FusedMoEModularMethod</code></td><td><code>fused_moe_modular_method.py:49-63</code>, <code>fused_moe_modular_method.py:89-111</code></td><td>加载后把旧 quant method 包装成 <code>FusedMoEKernel</code>,forward 时把 layer 的 <code>w13_weight</code>/<code>w2_weight</code>、top-k 元数据和 expert map 传给 kernel。</td></tr>
+</tbody>
+</table>
+
+<h2>关键代码片段</h2>
+<h3>1. runner 在 monolithic 和普通路径之间分叉</h3>
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/runner/moe_runner.py:514-537
+if self._quant_method.is_monolithic:
+    fused_out = self._quant_method.apply_monolithic(
+        layer=layer,
+        x=hidden_states,
+        router_logits=router_logits,
+        input_ids=input_ids,
+    )
+else:
+    topk_weights, topk_ids = self.router.select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        input_ids=input_ids,
+    )
+
+    fused_out = self._quant_method.apply(
+        layer=layer,
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=self._shared_experts,
+        shared_experts_input=shared_experts_input,
+    )</code></pre>
+
+<h3>2. backend 被选中前的共同支持性检查</h3>
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/modular_kernel.py:536-582
+if not cls._supports_current_device():
+    return False, _make_reason(f"current device {current_platform.device_name}")
+elif not (moe_config.is_act_and_mul or cls._supports_no_act_and_mul()):
+    return False, _make_reason("no act_and_mul MLP layer")
+elif not cls._supports_activation(moe_config.activation):
+    return False, _make_reason(f"{moe_config.activation} activation")
+elif not cls._supports_quant_scheme(weight_key, activation_key):
+    return False, _make_reason(
+        f"quantization scheme {weight_key}x{activation_key}"
+    )
+elif not cls._supports_parallel_config(moe_config.moe_parallel_config):
+    return False, _make_reason(
+        f"parallel config {moe_config.moe_parallel_config}"
+    )
+elif not cls._supports_routing_method(
+    moe_config.routing_method, weight_key, activation_key
+):
+    return False, _make_reason(f"routing method {moe_config.routing_method}")
+...
+elif activation_format != cls.activation_format():
+    return False, _make_reason(f"{activation_format.value} activation format")
+elif envs.VLLM_BATCH_INVARIANT and not cls._supports_batch_invariance():
+    return False, _make_reason("batch invariance")
+elif moe_config.is_lora_enabled and not cls.supports_lora():
+    return False, _make_reason("LoRA")</code></pre>
+
+<h3>3. FP8 selector 的典型结构</h3>
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/oracle/fp8.py:281-308,390-407
+runner_backend = config.moe_backend
+if runner_backend != "auto":
+    requested_backend = map_fp8_backend(runner_backend)
+    if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+        if requested_backend == Fp8MoeBackend.DEEPGEMM:
+            requested_backend = Fp8MoeBackend.BATCHED_DEEPGEMM
+        elif requested_backend == Fp8MoeBackend.TRITON:
+            requested_backend = Fp8MoeBackend.BATCHED_TRITON
+        elif requested_backend == Fp8MoeBackend.VLLM_CUTLASS:
+            requested_backend = Fp8MoeBackend.BATCHED_VLLM_CUTLASS
+
+    if requested_backend in [Fp8MoeBackend.VLLM_CUTLASS,
+                             Fp8MoeBackend.BATCHED_VLLM_CUTLASS] \
+            and not allow_vllm_cutlass:
+        raise ValueError("vLLM CUTLASS FP8 MoE backend is disabled...")
+    return _return_or_raise(requested_backend, config, weight_key,
+                            activation_key, activation_format)
+
+if not allow_vllm_cutlass:
+    AVAILABLE_BACKENDS.remove(Fp8MoeBackend.VLLM_CUTLASS)
+    AVAILABLE_BACKENDS.remove(Fp8MoeBackend.BATCHED_VLLM_CUTLASS)
+
+for backend in AVAILABLE_BACKENDS:
+    for k_cls in backend_to_kernel_cls(backend):
+        supported, reason = k_cls.is_supported_config(...)
+        if supported:
+            return backend, k_cls</code></pre>
+
+<h3>4. DeepSeek V4 MegaMoE 是模型专用路径</h3>
+<pre><code class="language-python"># vllm/models/deepseek_v4/nvidia/model.py:628-655
+self.use_mega_moe = (
+    vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+)
+if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
+    raise NotImplementedError(
+        "DeepSeek V4 MegaMoE currently requires expert parallel. "
+        "Enable it with --enable-expert-parallel, or pick a different "
+        "moe backend."
+    )
+...
+if self.use_mega_moe and self.scoring_func != "sqrtsoftplus":
+    raise NotImplementedError(
+        "DeepSeek V4 MegaMoE currently supports sqrtsoftplus routing only."
+    )
+if self.use_mega_moe and getattr(config, "expert_dtype", "fp4") != "fp4":
+    raise NotImplementedError(
+        "DeepSeek V4 MegaMoE only supports fp4 experts..."
+    )</code></pre>
+
+<h2>Backend dispatch 决策树</h2>
+<pre class="mermaid">
+flowchart TD
+  A["FusedMoEConfig.moe_backend<br/>kernel.py:171-190"] --> B["quant_config.get_quant_method() or UnquantizedFusedMoEMethod<br/>layer.py:351-369"]
+  B --> C{"Quant family / method"}
+  C --> U["Unquantized<br/>oracle/unquantized.py"]
+  C --> F8["FP8 / MXFP8<br/>oracle/fp8.py, oracle/mxfp8.py"]
+  C --> M4["MXFP4<br/>oracle/mxfp4.py"]
+  C --> N4["NVFP4<br/>oracle/nvfp4.py"]
+  C --> I8["INT8<br/>oracle/int8.py"]
+  C --> WN["WNA16 GPTQ/AWQ/CT<br/>oracle/int_wna16.py"]
+  C --> W4["W4A8<br/>oracle/w4a8.py"]
+  C --> DS["DeepSeek V4 MegaMoE<br/>models/deepseek_v4/nvidia/model.py"]
+
+  U --> X{"moe_backend == auto?"}
+  F8 --> X
+  M4 --> X
+  N4 --> X
+  I8 --> X
+  WN --> Y["family priority only<br/>WNA16 selector has Marlin/Batched Marlin"]
+  W4 --> Z["single family backend<br/>CUTLASS"]
+  DS --> Z2["only when moe_backend == deep_gemm_mega_moe"]
+
+  X -- explicit --> E["map_*_backend()<br/>reject unsupported string"]
+  X -- auto --> P["family-specific priority list<br/>plus env overrides"]
+  E --> S["k_cls.is_supported_config()<br/>device + quant + activation + parallel + routing + shape"]
+  P --> S
+  Y --> S
+  Z --> S
+  Z2 --> R["custom op deepseek_v4_mega_moe_experts"]
+  S --> K["make_*_moe_kernel()<br/>prepare/finalize + experts class"]
+  K --> O["quant_method.apply() / apply_monolithic()"]
+</pre>
+
+<h2>配置层可见的 backend 字符串</h2>
+<p><code>MoEBackend</code> Literal 的完整列表在 <code>vllm/config/kernel.py:122-137</code>;说明文字在 <code>kernel.py:171-190</code>。下面的“实际映射”只列当前代码能验证到的 selector 路径。</p>
+<table>
+<thead><tr><th>配置值</th><th>实际映射与适用范围</th><th>关键代码</th></tr></thead>
+<tbody>
+<tr><td><code>auto</code></td><td>进入各 quant family 自己的 priority list;不是全局统一排序。每个候选还要通过 <code>is_supported_config()</code>。</td><td><code>oracle/unquantized.py:170-291</code>, <code>oracle/fp8.py:234-419</code>, <code>oracle/mxfp4.py:462-584</code>, <code>oracle/nvfp4.py:170-333</code></td></tr>
+<tr><td><code>triton</code></td><td>unquantized/FP8/INT8 走 <code>TritonExperts</code> 或 batched Triton;MXFP4 走 GPT-OSS Triton classes <code>OAITritonMxfp4ExpertsMonolithic</code>/<code>OAITritonExperts</code>。NVFP4/MXFP8/W4A8/WNA16 selector 不接受这个显式值。</td><td><code>oracle/unquantized.py:131-144</code>, <code>oracle/fp8.py:204-220</code>, <code>oracle/int8.py:56-66</code>, <code>oracle/mxfp4.py:144-158</code>, <code>oracle/mxfp4.py:247-248</code></td></tr>
+<tr><td><code>triton_unfused</code></td><td>MXFP4 专用,映射到 <code>UnfusedOAITritonExperts</code>。</td><td><code>oracle/mxfp4.py:153-158</code>, <code>oracle/mxfp4.py:248</code></td></tr>
+<tr><td><code>deep_gemm</code></td><td>FP8 block W8A8 映射到 <code>TritonOrDeepGemmExperts</code>,不满足 shape 时可回退 Triton;batched activation format 映射到 <code>BatchedDeepGemmExperts</code>。MXFP4 映射到 <code>DeepGemmFP4Experts</code>,要求 DeepGEMM 和 SM100+。</td><td><code>oracle/fp8.py:129-141</code>, <code>oracle/fp8.py:204-220</code>, <code>oracle/fp8.py:281-293</code>, <code>oracle/mxfp4.py:115-120</code>, <code>oracle/mxfp4.py:236</code>, <code>experts/triton_deep_gemm_moe.py:24-86</code></td></tr>
+<tr><td><code>deep_gemm_mega_moe</code></td><td>不是通用 oracle backend。它是 DeepSeek V4 NVIDIA 模型里的专用 MegaMoE 路径,要求 expert parallel、<code>sqrtsoftplus</code> routing、<code>expert_dtype=="fp4"</code>,并调用 <code>torch.ops.vllm.deepseek_v4_mega_moe_experts</code>。</td><td><code>kernel.py:126</code>, <code>models/deepseek_v4/nvidia/model.py:523-531</code>, <code>models/deepseek_v4/nvidia/model.py:608-613</code>, <code>models/deepseek_v4/nvidia/model.py:628-655</code></td></tr>
+<tr><td><code>cutlass</code></td><td>FP8 显式映射到 vLLM CUTLASS,但 <code>allow_vllm_cutlass=False</code> 时会拒绝;NVFP4 映射到 <code>CutlassExpertsFp4</code>;W4A8 量化族的 selector 只有 CUTLASS。unquantized selector 不接受 <code>cutlass</code>。</td><td><code>oracle/fp8.py:204-220</code>, <code>oracle/fp8.py:294-304</code>, <code>oracle/nvfp4.py:141-157</code>, <code>oracle/w4a8.py:32-79</code></td></tr>
+<tr><td><code>flashinfer_trtllm</code></td><td>unquantized、FP8/MXFP8、MXFP4、NVFP4 均有映射。多处 TRTLLM expert 要求 CUDA Blackwell family SM100+ 与 FlashInfer TRTLLM fused MoE 可用。</td><td><code>oracle/unquantized.py:131-144</code>, <code>oracle/fp8.py:114-120</code>, <code>oracle/mxfp8.py:18-28</code>, <code>oracle/mxfp4.py:122-132</code>, <code>oracle/nvfp4.py:78-88</code>, <code>experts/trtllm_fp8_moe.py:63-71</code></td></tr>
+<tr><td><code>flashinfer_cutlass</code></td><td>unquantized、FP8、MXFP4、NVFP4 均有映射。FlashInfer CUTLASS expert 支持的设备和 quant scheme 由 <code>FlashInferExperts._supports_*</code> 决定。</td><td><code>oracle/unquantized.py:94-99</code>, <code>oracle/fp8.py:122-127</code>, <code>oracle/mxfp4.py:134-142</code>, <code>oracle/nvfp4.py:90-95</code>, <code>experts/flashinfer_cutlass_moe.py:135-188</code></td></tr>
+<tr><td><code>flashinfer_cutedsl</code></td><td>NVFP4 专用。auto 中包含 standard 与 batched CuteDSL;显式 <code>flashinfer_cutedsl</code> 在 batched activation format 下会改成 <code>FLASHINFER_CUTEDSL_BATCHED</code>。</td><td><code>oracle/nvfp4.py:97-109</code>, <code>oracle/nvfp4.py:141-157</code>, <code>oracle/nvfp4.py:170-182</code>, <code>oracle/nvfp4.py:236-245</code></td></tr>
+<tr><td><code>flashinfer_b12x</code></td><td>NVFP4 SM12x 专用,显式 opt-in。auto list 明确排除了 B12X,直到上游 CUTLASS SM121 MMA op guard 解决。</td><td><code>oracle/nvfp4.py:111-116</code>, <code>oracle/nvfp4.py:141-157</code>, <code>oracle/nvfp4.py:170-173</code>, <code>experts/flashinfer_b12x_moe.py:29-43</code>, <code>experts/flashinfer_b12x_moe.py:117-134</code></td></tr>
+<tr><td><code>marlin</code></td><td>FP8、MXFP4、MXFP8、NVFP4 都可显式映射到 Marlin。WNA16 量化族不读用户 backend map,但候选只有 <code>MARLIN</code>/<code>BATCHED_MARLIN</code>。Marlin 是 weight-only / mixed precision 风格,FP8 Marlin 使用 W8A16 quant config。</td><td><code>oracle/fp8.py:143-148</code>, <code>oracle/fp8.py:529-535</code>, <code>oracle/mxfp4.py:173-185</code>, <code>oracle/mxfp8.py:18-28</code>, <code>oracle/nvfp4.py:125-130</code>, <code>oracle/int_wna16.py:37-72</code></td></tr>
+<tr><td><code>humming</code></td><td>MXFP4 selector 显式映射到 <code>HummingIndexedExperts</code>/<code>HummingGroupedExperts</code>/<code>BatchedHummingGroupedExperts</code>。MXFP4 auto priority 没有 Humming;Humming 也可作为独立 quantization method 选择。</td><td><code>oracle/mxfp4.py:160-171</code>, <code>oracle/mxfp4.py:249</code>, <code>oracle/mxfp4.py:270-311</code>, <code>quantization/humming.py:334-353</code></td></tr>
+<tr><td><code>aiter</code></td><td>ROCm AITER backend。unquantized、FP8、MXFP4 有映射;ROCm auto priority 会优先或只列 AITER 相关候选,并受 <code>VLLM_ROCM_USE_AITER</code>/<code>VLLM_ROCM_USE_AITER_MOE</code> 等 env 影响。</td><td><code>oracle/unquantized.py:57-62</code>, <code>oracle/unquantized.py:270-277</code>, <code>oracle/fp8.py:69-82</code>, <code>oracle/fp8.py:380-388</code>, <code>oracle/mxfp4.py:187-206</code>, <code>oracle/mxfp4.py:251-257</code></td></tr>
+<tr><td><code>emulation</code></td><td>MXFP4 和 NVFP4 显式 debug/research fallback。MXFP4 auto error 文案提示需要研究/调试时显式传 <code>--moe-backend emulation</code>;NVFP4 auto list 把 emulation 放最后。</td><td><code>oracle/mxfp4.py:218-223</code>, <code>oracle/mxfp4.py:260</code>, <code>oracle/mxfp4.py:574-582</code>, <code>oracle/nvfp4.py:131-136</code>, <code>oracle/nvfp4.py:174-182</code></td></tr>
+</tbody>
+</table>
+
+<div class="box">注意:CPU、XPU、TPU、OOT 是内部 selector 可能返回的 backend,但不在 <code>MoEBackend</code> Literal 中作为用户配置字符串。例子包括 unquantized 的 CPU/XPU/TPU/OOT 分支,FP8 的 CPU/XPU 分支,MXFP4 的 CPU/XPU 分支。</div>
+
+<h2>Auto priority 按量化族拆解</h2>
+<table>
+<thead><tr><th>量化族</th><th>显式 backend map</th><th><code>auto</code> priority / 特殊逻辑</th><th>权重/quant config 转换</th></tr></thead>
+<tbody>
+<tr><td>Unquantized</td><td>只接受 <code>triton</code>、<code>flashinfer_trtllm</code>、<code>flashinfer_cutlass</code>、<code>aiter</code>。</td><td>ROCm: AITER, Triton, BatchedTriton;CUDA: FlashInfer TRTLLM, FlashInfer CUTLASS, Triton, BatchedTriton;XPU/CPU 分别单独返回。DP size &gt; 1 时把 FlashInfer CUTLASS 移到末尾。LoRA 启用时直接选 Triton。env 可强制/禁用 FlashInfer FP16 和 AITER。</td><td>AITER shuffle weights;FlashInfer CUTLASS 把 <code>w13</code> 从 <code>[w1;w3]</code> 调成 <code>[w3;w1]</code>;TRTLLM 还转换 block layout。见 <code>oracle/unquantized.py:295-320</code>。</td></tr>
+<tr><td>FP8</td><td>接受 <code>triton</code>、<code>deep_gemm</code>、<code>cutlass</code>、<code>flashinfer_trtllm</code>、<code>flashinfer_cutlass</code>、<code>marlin</code>、<code>aiter</code>。</td><td>默认列表:AITER, FlashInfer TRTLLM, FlashInfer CUTLASS, DeepGEMM, vLLM CUTLASS, Triton, Marlin, Batched DeepGEMM, Batched CUTLASS, Batched Triton, XPU, CPU。Hopper block FP8 下,TP 优先 Triton,EP 优先 FlashInfer CUTLASS。<code>allow_vllm_cutlass=False</code> 时移除 vLLM CUTLASS。env 可强制 FlashInfer、DeepGEMM、Marlin 测试和 AITER。</td><td>DeepGEMM 要 block quant 并调用 <code>prepare_fp8_moe_layer_for_deepgemm()</code>;Marlin 调 <code>prepare_fp8_moe_layer_for_marlin()</code> 或 MXFP8 Marlin;FlashInfer 调 <code>prepare_fp8_moe_layer_for_fi()</code>。见 <code>oracle/fp8.py:422-502</code>。</td></tr>
+<tr><td>MXFP4 / GPT-OSS</td><td>接受 <code>deep_gemm</code>、<code>flashinfer_trtllm</code>、<code>flashinfer_cutlass</code>、<code>triton</code>、<code>triton_unfused</code>、<code>humming</code>、<code>marlin</code>、<code>aiter</code>、<code>xpu</code>、<code>cpu</code>、<code>emulation</code>。mapper 内还有若干 <code>_afp8</code>/<code>aiter_mxfp4_*</code> 别名,但它们不在 <code>KernelConfig.MoEBackend</code> Literal 中。</td><td>GPT-OSS priority: FlashInfer TRTLLM BF16/MXFP8, AITER BF16/FP8/MXFP4, Triton, FlashInfer CUTLASS BF16/MXFP8, Marlin, Batched Marlin, XPU。通用 MXFP4 priority: ROCm 只 AITER BF16;XPU 只 XPU;CUDA 为 FlashInfer TRTLLM MXFP8, DeepGEMM MXFP4, Marlin, Batched Marlin。Humming 不在 auto priority。</td><td>DeepGEMM FP4 直接保留/上转换 scale;Humming 调 <code>prepare_humming_moe_layer()</code>;Marlin 调 <code>prepare_moe_mxfp4_layer_for_marlin()</code>;TRTLLM/CUTLASS/AITER 有各自格式转换。见 <code>oracle/mxfp4.py:692-760</code> 及后续转换分支。</td></tr>
+<tr><td>DeepSeek V4 MXFP4</td><td>显式 backend 仍走 <code>map_mxfp4_backend()</code>。</td><td>auto 使用 <code>select_deepseek_v4_mxfp4_moe_backend()</code>。ROCm 且 routing method 为 DeepseekV4 时优先 <code>TRITON_UNFUSED</code> 再 AITER;否则用通用 MXFP4 priority。见 <code>oracle/mxfp4.py:587-654</code>。</td><td><code>Mxfp4MoEMethod</code> 调该 selector,见 <code>quantization/mxfp4.py:470-477</code>。</td></tr>
+<tr><td>MXFP8</td><td>只接受 <code>flashinfer_trtllm</code>、<code>marlin</code>、<code>xpu</code>。</td><td>auto 按 FlashInfer TRTLLM, Marlin, XPU 顺序尝试,每个 backend 复用 FP8 oracle 的 expert class list 并检查 <code>(kMxfp8Static,kMxfp8Dynamic)</code>。见 <code>oracle/mxfp8.py:18-91</code>。</td><td>后处理复用 FP8 的 <code>convert_to_fp8_moe_kernel_format()</code> 与 <code>make_fp8_moe_kernel()</code>。</td></tr>
+<tr><td>NVFP4</td><td>接受 <code>cutlass</code>、<code>flashinfer_trtllm</code>、<code>flashinfer_cutlass</code>、<code>flashinfer_cutedsl</code>、<code>flashinfer_b12x</code>、<code>marlin</code>、<code>emulation</code>。</td><td>auto 顺序:FlashInfer TRTLLM, FlashInfer CuteDSL, FlashInfer CuteDSL batched, FlashInfer CUTLASS, vLLM CUTLASS, Marlin, Emulation。B12X 明确从 auto 排除,必须显式。若模型设置 <code>swiglu_limit</code>,候选被过滤到 <code>FLASHINFER_TRTLLM</code>。env 可强制 FlashInfer FP4 或 Marlin 测试。</td><td>FlashInfer/CUTLASS 调 <code>prepare_nvfp4_moe_layer_for_fi_or_cutlass()</code>;CuteDSL 调专用转换;Marlin 清空 activation scale 后调 <code>prepare_nvfp4_moe_layer_for_marlin()</code>;Emulation 要 activation global scales。见 <code>oracle/nvfp4.py:336-460</code>。</td></tr>
+<tr><td>INT8</td><td>只接受 <code>triton</code>。</td><td>auto 只有 Triton。支持 W8A8 或 W8A16 quant config,由是否有 activation scales 决定。见 <code>oracle/int8.py:29-39</code>, <code>oracle/int8.py:145-170</code>。</td><td><code>make_int8_moe_kernel()</code> 创建 prepare/finalize + TritonExperts。见 <code>oracle/int8.py:173-190</code>。</td></tr>
+<tr><td>WNA16</td><td>selector 不读取用户 <code>moe_backend</code> 字符串。</td><td>候选只有 <code>MARLIN</code> 和 <code>BATCHED_MARLIN</code>,activation key 固定为 None/BF16 activation。用于 GPTQ/AWQ/CompressedTensors weight-only int4/int8 + 16-bit activation MoE。见 <code>oracle/int_wna16.py:37-145</code>。</td><td>GPTQ/AWQ repack、scale/bias/g_idx 处理集中在 <code>oracle/int_wna16.py</code>,kernel 创建见 <code>oracle/int_wna16.py:148-206</code>。</td></tr>
+<tr><td>W4A8</td><td>selector 不读取用户 <code>moe_backend</code> 字符串。</td><td>唯一 backend 是 CUTLASS。检查 <code>(kInt4Static,kFp8DynamicTokenSym)</code> 与 activation format 后返回 <code>CutlassExpertsW4A8Fp8</code>。见 <code>oracle/w4a8.py:32-79</code>。</td><td>权重转换把 int4 packed weight 转 signed int4,调用 CUTLASS reorder,并把 BF16 scales 转 FP8/pack scale。见 <code>oracle/w4a8.py:82-147</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>Backend 差异对比</h2>
+<table>
+<thead><tr><th>backend / expert family</th><th>入口 class / op</th><th>精度与量化支持</th><th>代码体现的取舍与选中条件</th></tr></thead>
+<tbody>
+<tr><td>Triton standard / batched</td><td><code>TritonExperts</code>, <code>BatchedTritonExperts</code>;standard 路径两次 <code>invoke_fused_moe_triton_kernel()</code>。</td><td>Unquantized;CUDA 7.5+ 可 INT8;平台支持 FP8 时可 FP8 per-channel/per-tensor/block。见 <code>experts/triton_moe.py:79-100</code>。</td><td>覆盖面广,支持多种 activation,并声明 LoRA mixin。standard 路径不支持 FlashInfer NVLink A2A 配置。FP8 selector 中它通常排在 FlashInfer/DeepGEMM/CUTLASS 后,但 Hopper block FP8 TP 场景会被移到最前。见 <code>experts/triton_moe.py:103-121</code>, <code>oracle/fp8.py:87-98</code>。</td></tr>
+<tr><td>GPT-OSS Triton / Triton unfused</td><td><code>OAITritonMxfp4ExpertsMonolithic</code>, <code>OAITritonExperts</code>, <code>UnfusedOAITritonExperts</code>;核心函数 <code>triton_kernel_moe_forward()</code>。</td><td>MXFP4 GPT-OSS 路径,由 <code>oracle/mxfp4.py</code> 的 <code>triton</code>/<code>triton_unfused</code> 映射选择。</td><td>monolithic Triton 可以把 routing 和 experts 放在同一 backend 流程中;legacy API 下无 expert map 时 fused routing 合并 softmax/top-k/bitmatrix/routing metadata。见 <code>experts/gpt_oss_triton_kernels_moe.py:306-370</code>, <code>oracle/mxfp4.py:144-158</code>。</td></tr>
+<tr><td>DeepGEMM</td><td>FP8: <code>TritonOrDeepGemmExperts</code> 包一层 fallback;<code>DeepGemmExperts</code> 调 <code>m_grouped_fp8_gemm_nt_contiguous</code> 两次。MXFP4: <code>DeepGemmFP4Experts</code>。</td><td>FP8 block W8A8: <code>(kFp8Static128BlockSym,kFp8Dynamic128Sym)</code>;MXFP4 FP4 weights + FP8 activation,SM100+。见 <code>experts/deep_gemm_moe.py:146-157</code>, <code>experts/deep_gemm_moe.py:332-365</code>。</td><td>FP8 DeepGEMM 对 shape 有硬条件:M/N/K 对齐、N &gt; 512、FP8 weights contiguous;不满足时 <code>TritonOrDeepGemmExperts</code> 回退 Triton。见 <code>experts/deep_gemm_moe.py:49-118</code>, <code>experts/triton_deep_gemm_moe.py:24-86</code>。</td></tr>
+<tr><td>vLLM CUTLASS</td><td>FP8: <code>CutlassExpertsFp8</code>/<code>CutlassBatchedExpertsFp8</code>;NVFP4: <code>CutlassExpertsFp4</code>;W4A8: <code>CutlassExpertsW4A8Fp8</code>。</td><td>FP8 W8A8 per-channel/per-tensor;NVFP4 W4A4;W4A8 int4 weight + FP8 activation。见 <code>experts/cutlass_moe.py:304-321</code>, <code>experts/cutlass_moe.py:694-715</code>, <code>oracle/w4a8.py:49-79</code>。</td><td>FP8 CUTLASS standard path不支持 expert map,因此 standard DP/EP 相关配置受限;batched format 可绕过 expert map。NVFP4 CUTLASS standard path要求 <code>ep_size == 1</code>。见 <code>experts/cutlass_moe.py:385-409</code>, <code>experts/cutlass_moe.py:717-728</code>。</td></tr>
+<tr><td>FlashInfer TRTLLM</td><td>Unquantized BF16/FP16: <code>TrtLlmBf16Experts</code>;FP8/MXFP8: <code>TrtLlmFp8ExpertsMonolithic</code>/<code>Modular</code>;MXFP4: <code>TrtLlmMxfp4ExpertsMonolithic</code>/<code>Modular</code>;NVFP4: <code>TrtLlmNvFp4ExpertsMonolithic</code>/<code>Modular</code>。</td><td>FP8 block/MXFP8,MXFP4 BF16 or MXFP8 activation,NVFP4。多数 TRTLLM experts 要 CUDA Blackwell family SM100+ 且 FlashInfer TRTLLM fused MoE 可用。见 <code>experts/trtllm_fp8_moe.py:63-71</code>, <code>experts/trtllm_mxfp4_moe.py:88-110</code>, <code>experts/trtllm_nvfp4_moe.py:112-145</code>。</td><td>monolithic variants 把 routing 和 experts 包进 backend,但 parallel/routing 限制更严;modular variants 更容易和 prepare/finalize 组合。selector 通常把 monolithic 放在 modular 前面。见 <code>oracle/fp8.py:114-120</code>, <code>oracle/mxfp4.py:122-132</code>, <code>oracle/nvfp4.py:78-88</code>。</td></tr>
+<tr><td>FlashInfer CUTLASS</td><td><code>FlashInferExperts</code>,调用 FlashInfer fused MoE API。</td><td>支持 unquantized/FP8 per-tensor/FP8 block、MXFP4 BF16/MXFP8、NVFP4,具体组合受设备能力限制:SM90 支持 unquantized/FP8 per-tensor、FP8 block、MXFP4 BF16;SM100+ 支持 MXFP4+MXFP8 和 NVFP4。见 <code>experts/flashinfer_cutlass_moe.py:135-188</code>。</td><td>standard activation format,不支持 expert map。FP8 block path 通过 <code>expects_unquantized_inputs</code> 让 prepare 延后 input quant,由 FlashInfer path 处理 scaling。见 <code>experts/flashinfer_cutlass_moe.py:130-132</code>, <code>experts/flashinfer_cutlass_moe.py:206-214</code>。</td></tr>
+<tr><td>FlashInfer CuteDSL / B12X</td><td>NVFP4 CuteDSL: <code>FlashInferCuteDSLExperts</code>/<code>FlashInferCuteDSLBatchedExperts</code>;B12X: <code>FlashInferB12xExperts</code>。</td><td>NVFP4 only。CuteDSL 要 CUDA SM100 family 和 <code>has_flashinfer_cutedsl_moe_nvfp4()</code>;B12X 要 SM120 family 和 <code>has_flashinfer_b12x_moe()</code>。见 <code>experts/flashinfer_cutedsl_moe.py:69-93</code>, <code>experts/flashinfer_b12x_moe.py:117-138</code>。</td><td>CuteDSL 注释说明 kernel 内部处理 routing、expert compute 和 reduction。B12X 注释说明单 kernel fuse token dispatch、两段 GEMM、SwiGLU 和 top-k reduction,且在 kernel 内 BF16-&gt;FP4 量化;但 B12X 不进入 auto,必须显式。见 <code>experts/flashinfer_cutedsl_moe.py:28-35</code>, <code>experts/flashinfer_b12x_moe.py:29-43</code>, <code>oracle/nvfp4.py:170-173</code>。</td></tr>
+<tr><td>Marlin</td><td><code>MarlinExperts</code>/<code>BatchedMarlinExperts</code>;核心是两次 <code>ops.moe_wna16_marlin_gemm()</code>。</td><td>CUDA 7.5+;weight keys 包含 FP8、MXFP4、MXFP8、NVFP4、Int4、Int8。FP8 Marlin 在 oracle 中使用 W8A16 quant config;WNA16 是 weight-only int4/int8 + 16-bit activation。见 <code>experts/marlin_moe.py:598-624</code>, <code>oracle/fp8.py:529-535</code>, <code>oracle/int_wna16.py:37-72</code>。</td><td>weight-only/mixed precision 取向明显:输入可按 env 做 INT8/FP8 activation quant,但主要依赖 packed weight + scale。支持多 activation,但不支持 FlashInfer NVLink A2A 配置。见 <code>experts/marlin_moe.py:57-222</code>, <code>experts/marlin_moe.py:627-647</code>。</td></tr>
+<tr><td>Humming</td><td><code>HummingIndexedExperts</code>, <code>HummingGroupedExperts</code>, <code>BatchedHummingGroupedExperts</code>;最终调用外部 <code>HummingMethod.forward_layer()</code>。</td><td><code>HummingExpertsBase._supports_quant_scheme()</code> 返回 True,但当前 backend map 主要来自 MXFP4 selector 的 <code>humming</code> 显式项,或 <code>--quantization humming</code> 路径。CUDA capability 至少 7.5。见 <code>experts/fused_humming_moe.py:149-162</code>, <code>oracle/mxfp4.py:160-171</code>。</td><td><code>VLLM_HUMMING_MOE_GEMM_TYPE</code> 可在 indexed/grouped/auto 间切换;auto 在 SM90+ 默认 grouped,否则 indexed。MXFP4 auto 不包含 Humming,需要显式。见 <code>experts/fused_humming_moe.py:51-75</code>, <code>oracle/mxfp4.py:270-311</code>。</td></tr>
+<tr><td>ROCm AITER</td><td><code>AiterExperts</code>、<code>AiterW4A8ExpertsMonolithic</code> 等。</td><td>unquantized、FP8、MXFP4 BF16/FP8/MXFP4 variants。见 <code>oracle/unquantized.py:101-106</code>, <code>oracle/fp8.py:164-169</code>, <code>oracle/mxfp4.py:187-206</code>。</td><td>ROCm 平台优先或专用路径;env 可强制/禁用 AITER。AITER router 还可和 fused shared experts top-k 组合。见 <code>oracle/unquantized.py:57-62</code>, <code>oracle/fp8.py:380-388</code>, <code>router/router_factory.py:200-213</code>。</td></tr>
+<tr><td>XPU / CPU</td><td>XPU: <code>XPUExperts</code>、<code>XPUExpertsFp8</code>、<code>XPUExpertsMxfp8</code>、<code>XPUExpertsMXFp4</code>;CPU: <code>CPUExpertsFp8</code>、<code>CPUExpertsMxfp4</code>。</td><td>平台 fallback。XPU supports unquantized/FP8/MXFP8/MXFP4 paths;CPU 当前文件注释为 FP8 W8A16 和 MXFP4 W4A16 fused MoE experts。见 <code>experts/xpu_moe.py:36-94</code>, <code>experts/cpu_moe.py:1-82</code>。</td><td>不是用户可配 <code>MoEBackend</code> Literal,而是 selector 按 <code>current_platform</code> 自动返回。CPU FP8 是 monolithic,内部自己 select experts。见 <code>oracle/unquantized.py:77-81</code>, <code>oracle/fp8.py:99-107</code>, <code>experts/cpu_moe.py:106-140</code>。</td></tr>
+<tr><td>Emulation</td><td>MXFP4: <code>OCP_MXQuantizationEmulationTritonExperts</code>;NVFP4: <code>Nvfp4QuantizationEmulationTritonExperts</code>。</td><td>MXFP4/NVFP4 debug or research fallback。</td><td>MXFP4 selector 的错误信息明确建议研究/调试时用 <code>--moe-backend emulation</code>;NVFP4 auto 最后才尝试 Emulation。见 <code>oracle/mxfp4.py:574-582</code>, <code>oracle/nvfp4.py:174-182</code>。</td></tr>
+<tr><td>DeepGEMM MegaMoE</td><td><code>torch.ops.vllm.deepseek_v4_mega_moe_experts</code>,实际类在 <code>vllm/models/deepseek_v4/nvidia/model.py</code>。</td><td>DeepSeek V4 fp4 experts 专用,不是通用 fused_moe oracle。要求 expert parallel、sqrtsoftplus routing、fp4 expert dtype。</td><td>该路径有自己的 input staging、symmetric buffer 和 DeepGEMM 调用,不经过通用 <code>oracle/deep_gemm_mega_moe.py</code>。见 <code>models/deepseek_v4/nvidia/model.py:512-560</code>, <code>models/deepseek_v4/nvidia/model.py:608-655</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>几条容易误读的点</h2>
+<table>
+<thead><tr><th>容易误读</th><th>实际情况</th><th>依据</th></tr></thead>
+<tbody>
+<tr><td><code>moe_backend=cutlass</code> 是否总能选 CUTLASS?</td><td>不能。FP8 显式 CUTLASS 还受 <code>allow_vllm_cutlass</code> 保护;unquantized selector 不接受 <code>cutlass</code>;W4A8 的 CUTLASS 是量化族唯一选择,不是由显式 map 控制。</td><td><code>oracle/fp8.py:294-304</code>, <code>oracle/unquantized.py:131-144</code>, <code>oracle/w4a8.py:49-79</code></td></tr>
+<tr><td><code>humming</code> 是否 auto 会自动选?</td><td>当前 MXFP4 auto priority 没有 Humming。要走 Humming backend 需显式 <code>--moe-backend humming</code>,或使用 <code>--quantization humming</code> 的独立 quantization path。</td><td><code>oracle/mxfp4.py:249</code>, <code>oracle/mxfp4.py:270-311</code>, <code>quantization/humming.py:334-353</code></td></tr>
+<tr><td><code>deep_gemm</code> 是否没有 fallback?</td><td>FP8 路径的 <code>TritonOrDeepGemmExperts</code> 明确是 DeepGEMM with fallback to Triton for low latency shapes;当 shape、N、dtype、contiguous 条件不满足时回退。MXFP4 的 <code>DeepGemmFP4Experts</code> 则是单独 FP4 experts class。</td><td><code>experts/triton_deep_gemm_moe.py:24-86</code>, <code>experts/deep_gemm_moe.py:49-118</code>, <code>experts/deep_gemm_moe.py:332-365</code></td></tr>
+<tr><td><code>flashinfer_b12x</code> 是否 auto?</td><td>不是。NVFP4 auto list 注释明确把 B12X 排除,必须 <code>moe_backend="flashinfer_b12x"</code> 显式 opt-in。</td><td><code>oracle/nvfp4.py:170-173</code>, <code>oracle/nvfp4.py:141-157</code></td></tr>
+<tr><td>monolithic backend 是否还调用通用 router?</td><td>runner 对 monolithic quant method 直接调用 <code>apply_monolithic()</code>,传入 <code>router_logits</code>;非 monolithic 才先调用 <code>router.select_experts()</code>。</td><td><code>moe_runner.py:514-537</code>, <code>modular_kernel.py:1601-1631</code></td></tr>
+<tr><td>CPU/XPU 是否用户可配 backend 字符串?</td><td>不是 <code>MoEBackend</code> Literal 里的值,但 selector 会在对应平台自动返回内部 CPU/XPU backend。</td><td><code>kernel.py:122-137</code>, <code>oracle/unquantized.py:77-81</code>, <code>oracle/fp8.py:99-107</code>, <code>oracle/mxfp4.py:552-572</code></td></tr>
+</tbody>
+</table>
+
+<h2>按文件追代码的建议顺序</h2>
+<ol>
+  <li>先看 <code>vllm/config/kernel.py:122-190</code>,记住用户可配字符串只是入口名。</li>
+  <li>再看 <code>fused_moe/layer.py:296-444</code>,确认 router、<code>FusedMoEConfig</code>、quant method 和 runner 如何绑定。</li>
+  <li>看 <code>runner/moe_runner.py:496-537</code> 与 <code>runner/moe_runner.py:742-799</code>,抓住 monolithic 与普通 top-k 路径的分叉。</li>
+  <li>看 <code>router_factory.py:63-75</code> 与 <code>base_router.py:250-298</code>,确认 router 只输出 <code>topk_weights/topk_ids</code>。</li>
+  <li>按模型量化族进入对应 <code>fused_moe/oracle/*.py</code>:先读 enum、<code>map_*_backend()</code>、priority list,再读 <code>convert_to_*_kernel_format()</code> 和 <code>make_*_moe_kernel()</code>。</li>
+  <li>最后进 <code>fused_moe/experts/*.py</code> 看具体 <code>_supports_*</code> 和 <code>apply()</code>;这一步才能判断某 backend 为什么在当前硬件、量化格式或并行配置下被跳过。</li>
+</ol>
+
+<p class="meta">Mermaid 图在 MkDocs Material 页面中渲染;若直接打开 HTML 且站点没有全局 Mermaid loader,本文底部也加载 Mermaid CDN 作为兜底。</p>
+
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+mermaid.initialize({startOnLoad:true,theme:"default",securityLevel:"loose"});
+</script>
+</body>
+</html>

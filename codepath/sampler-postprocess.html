@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM 采样后处理与 fused sampler 对比学习笔记</title>
+<style>
+body{font:14px/1.65 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1120px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+h1,h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em}
+h2{margin-top:2rem}
+h3{margin-top:1.4rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;overflow:auto}
+pre code{background:transparent;padding:0}
+pre.mermaid{background:#fff;border:1px solid #d0d7de;border-radius:6px;padding:16px}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.lead{color:#57606a;font-size:15px}
+.meta{color:#57606a;font-size:12px}
+.ok{color:#0a7d20;font-weight:600}
+.warn{color:#b35900;font-weight:600}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da}
+.box{border-left:4px solid #0969da;background:#f6f8fa;padding:8px 12px;margin:12px 0}
+.small{font-size:12px;color:#57606a}
+nav a{margin-right:1rem}
+</style>
+</head>
+<body>
+<nav><a href="overview.html">&larr; overview</a><a href="index.html">codepath map</a><a href="humming-kernel.html">humming note</a><a href="marlin-kernel.html">marlin note</a><a href="moe-backends.html">moe backend</a></nav>
+
+<h1>vLLM 采样后处理与 fused sampler 对比学习笔记</h1>
+<p class="lead">结论先行:vLLM V1 的采样后处理是一条功能优先的模块化流水线,不是把温度、top-k、top-p、重复惩罚和 softmax 收进一个固定 CUDA kernel。普通 decode 从 <code>GPUModelRunner._sample()</code> 进入 <code>Sampler.forward()</code>,依次做可选 logprobs、FP32 logits、allowed/bad words、logits processor、penalties、greedy/random 分支、temperature、min-p、top-k/top-p、softmax + random sample、logprobs gather。spec decode 则在同一入口分到 <code>RejectionSampler</code>,先用普通 <code>Sampler</code> 采 bonus token,再处理 target logits 并用 Triton rejection kernels 接受、拒绝或恢复 draft token。</p>
+<p class="meta">源码基准:<code>/Users/f/Documents/vllm-workspace/tasks/opt-kimi-pd/vllm-int</code> 当前工作树。本文只依据本地 vLLM 源码行号;HPC-Ops 侧只使用任务给定前提:其 <code>fused_sampler</code> 将温度 / top-k / top-p / 重复惩罚 / softmax 融合为 2 个 kernel,不推断未给出的接口、参数或源码行。</p>
+
+<h2>一句话定位</h2>
+<table>
+<thead><tr><th>问题</th><th>源码事实</th></tr></thead>
+<tbody>
+<tr><td>采样后处理入口在哪里</td><td>执行模型后,runner 在 <code>gpu_model_runner.py:4357-4364</code> 先应用结构化输出 bitmask,再进入 <code>self._sample(logits, spec_decode_metadata)</code>。普通 decode 调 <code>self.sampler(...)</code>;spec decode 调 <code>self.rejection_sampler(...)</code>,见 <code>gpu_model_runner.py:3481-3510</code>。</td></tr>
+<tr><td>普通采样主流程</td><td><code>Sampler.forward()</code> 的类注释列出完整顺序:logprobs、FP32、allowed token、bad words、非 argmax-invariant processors、penalties、sample、logprobs gather、返回 <code>SamplerOutput</code>,见 <code>vllm/v1/sample/sampler.py:20-59</code>。实现主体见 <code>sampler.py:67-144</code>。</td></tr>
+<tr><td>随机采样 hot path</td><td><code>Sampler.sample()</code> 先算 greedy 备选,再做 temperature、argmax-invariant processors、top-k/top-p 和 weighted random sampling,最后按 temperature 是否接近 0 选择 greedy 或 random 结果,见 <code>sampler.py:238-297</code>。</td></tr>
+<tr><td>top-k/top-p 是否融合</td><td>vLLM 有一个 in-tree Triton top-k/top-p mask kernel,但它只把 logits mask 成 <code>-inf</code> 后返回;随机采样的 softmax 和 exponential race 仍在后续 <code>TopKTopPSampler.forward_native()</code> 中执行,见 <code>topk_topp_sampler.py:111-130</code> 与 <code>topk_topp_triton.py:966-1058</code>。</td></tr>
+<tr><td>重复惩罚在哪里</td><td>penalties 先构造 prompt/output token mask,重复惩罚走 <code>apply_repetition_penalties</code> custom op,frequency/presence penalty 再用 PyTorch 张量减法,见 <code>model_executor/layers/utils.py:51-89</code> 与 <code>_custom_ops.py:360-408</code>。</td></tr>
+<tr><td>logits processor 是什么机制</td><td>每个 processor 实现 <code>apply()</code>、<code>is_argmax_invariant()</code>、<code>update_state()</code>,见 <code>logits_processor/interface.py:60-106</code>。状态容器按是否影响 greedy argmax 分成两组,见 <code>logits_processor/state.py:148-160</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>端到端数据流</h2>
+<pre class="mermaid">
+flowchart TD
+  A["模型 forward 输出 logits"] --> B["structured output bitmask<br/>gpu_model_runner.py:4357-4361"]
+  B --> C["_sample(logits, spec_decode_metadata)<br/>gpu_model_runner.py:3481-3510"]
+  C --> D["InputBatch.sampling_metadata<br/>temperature/top-k/top-p/penalties/logitsprocs"]
+  D --> E{"spec_decode_metadata is None?"}
+  E -- yes --> F["Sampler.forward<br/>sampler.py:67-144"]
+  E -- no --> G["RejectionSampler.forward<br/>rejection_sampler.py:86-194"]
+  F --> H["SamplerOutput.sampled_token_ids<br/>[num_requests,1] int32"]
+  G --> I["SamplerOutput.sampled_token_ids<br/>[batch,max_spec_len+1] int32"]
+  H --> J["_update_states_after_model_execute<br/>gpu_model_runner.py:4366-4368"]
+  I --> J
+</pre>
+
+<p><code>InputBatch</code> 在请求加入时把 <code>SamplingParams</code> 拆成常驻 batch 状态:temperature、top-p、top-k、三类 penalty、per-request generator、logprobs、allowed token mask 和 bad words,见 <code>gpu_input_batch.py:183-288</code> 与 <code>gpu_input_batch.py:380-452</code>。每步 batch 改变后,它先更新 logits processor 状态,再重建 <code>SamplingMetadata</code>,见 <code>gpu_input_batch.py:820-829</code>。</p>
+
+<h3>SamplingParams 到 SamplingMetadata</h3>
+<table>
+<thead><tr><th>参数族</th><th>SamplingParams 定义/校验</th><th>InputBatch 批量化</th><th>Sampler 消费位置</th></tr></thead>
+<tbody>
+<tr><td>temperature / top-p / top-k / min-p</td><td>字段定义见 <code>sampling_params.py:205-218</code>;temperature 接近 0 时转 greedy 并重置 top-p/top-k/min-p,见 <code>sampling_params.py:436-441</code>;校验见 <code>sampling_params.py:477-499</code>。</td><td>加入请求时写 <code>temperature_cpu</code>、<code>top_p_cpu</code>、<code>top_k_cpu</code>,并维护 greedy/random/top-p/top-k 请求集合,见 <code>gpu_input_batch.py:380-397</code>。</td><td><code>Sampler.sample()</code> 使用 temperature、top-k、top-p,见 <code>sampler.py:268-286</code>;min-p 由 <code>MinPLogitsProcessor</code> 在 temperature 后、top-k/top-p 前执行,见 <code>sampler.py:275-279</code>。</td></tr>
+<tr><td>presence / frequency / repetition penalty</td><td>字段定义见 <code>sampling_params.py:193-204</code>;范围校验见 <code>sampling_params.py:464-476</code>。</td><td>加入请求时写三组 penalty CPU tensor 并登记非默认请求集合,见 <code>gpu_input_batch.py:398-408</code>;重建 metadata 时只在需要时拷贝到 GPU,见 <code>gpu_input_batch.py:844-858</code>。</td><td><code>Sampler.apply_penalties()</code> 调 <code>apply_all_penalties()</code>,见 <code>sampler.py:417-434</code>。</td></tr>
+<tr><td>allowed_token_ids / bad_words</td><td>字段定义见 <code>sampling_params.py:290-292</code> 与 <code>sampling_params.py:305-310</code>;bad words 在 tokenizer 阶段转 token ids,见 <code>sampling_params.py:586-608</code>;allowed token ids 校验见 <code>sampling_params.py:754-779</code>。</td><td>allowed token ids 构造成 bool mask,False 表示允许,True 表示会被 mask 成 <code>-inf</code>,见 <code>gpu_input_batch.py:426-447</code>;bad words 存成 <code>req_index -&gt; token id sequences</code>,见 <code>gpu_input_batch.py:449-452</code>。</td><td>allowed mask 先执行 <code>masked_fill_</code>,bad words 再逐请求检查前缀并禁掉最后一个 token,见 <code>sampler.py:390-397</code> 与 <code>ops/bad_words.py:9-37</code>。</td></tr>
+<tr><td>logprobs / prompt_logprobs / logprob_token_ids</td><td>字段定义见 <code>sampling_params.py:236-252</code>;最大数量和 <code>logprob_token_ids</code> 一致性校验见 <code>sampling_params.py:679-725</code>。</td><td><code>num_logprobs</code> 与 <code>logprob_token_ids</code> 按 request id 记录,见 <code>gpu_input_batch.py:254-258</code> 与 <code>gpu_input_batch.py:415-424</code>;metadata 中转成 req index,见 <code>gpu_input_batch.py:905-923</code>。</td><td>raw 或 processed logprobs 在 <code>Sampler.forward()</code> 开头/采样后产生,最后走 <code>gather_specific_token_logprobs()</code> 或 <code>gather_logprobs()</code>,见 <code>sampler.py:75-126</code> 与 <code>sampler.py:146-220</code>。</td></tr>
+<tr><td>seed</td><td><code>sampling_type</code> 根据 temperature 和 seed 返回 GREEDY / RANDOM_SEED / RANDOM,见 <code>sampling_params.py:627-633</code>。</td><td>请求若带 generator,放入 <code>req_index -&gt; torch.Generator</code> 字典,见 <code>gpu_input_batch.py:249-252</code> 与 <code>gpu_input_batch.py:410-413</code>。</td><td><code>random_sample()</code> 对带 generator 的行逐行覆盖 exponential random,见 <code>topk_topp_sampler.py:394-415</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>普通 decode 的 Sampler 流程</h2>
+<pre class="mermaid">
+flowchart TD
+  A["logits [B,V]"] --> B{"需要 sample logprobs?"}
+  B -- yes --> C["raw_logprobs = log_softmax(logits)<br/>或 raw_logits clone<br/>sampler.py:79-89"]
+  B -- no --> D["skip"]
+  C --> E["logits.to(float32)<br/>sampler.py:90-91"]
+  D --> E
+  E --> F["allowed_token_ids mask<br/>sampler.py:390-392"]
+  F --> G["bad_words prefix mask<br/>sampler.py:394-397"]
+  G --> H["non-argmax-invariant processors<br/>min_tokens/logit_bias/custom<br/>sampler.py:398-400"]
+  H --> I["penalties<br/>repetition + frequency + presence<br/>sampler.py:402-403"]
+  I --> J{"all_greedy?"}
+  J -- yes --> K["argmax + optional processed logprobs<br/>sampler.py:255-266"]
+  J -- no --> L["temperature div_<br/>sampler.py:270-273"]
+  L --> M["argmax-invariant processors<br/>min_p<br/>sampler.py:275-279"]
+  M --> N["top-k/top-p filter + random sample<br/>topk_topp_sampler.py:111-130"]
+  N --> O{"mixed greedy/random batch?"}
+  O -- yes --> P["torch.where(temp &lt; eps, greedy, random)<br/>sampler.py:291-297"]
+  O -- no --> Q["random result"]
+  K --> R["logprob gather / int32 output<br/>sampler.py:106-144"]
+  P --> R
+  Q --> R
+</pre>
+
+<h3>关键代码片段:普通采样分支</h3>
+<pre><code class="language-python"># vllm/v1/sample/sampler.py:250-286
+assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
+if sampling_metadata.all_random:
+    greedy_sampled = None
+else:
+    greedy_sampled = self.greedy_sample(logits)
+    if sampling_metadata.all_greedy:
+        ...
+        return greedy_sampled, processed_logprobs
+
+logits = self.apply_temperature(
+    logits, sampling_metadata.temperature, sampling_metadata.all_random
+)
+
+for processor in sampling_metadata.logitsprocs.argmax_invariant:
+    logits = processor.apply(logits)
+
+random_sampled, processed_logprobs = self.topk_topp_sampler(
+    logits,
+    sampling_metadata.generators,
+    sampling_metadata.top_k,
+    sampling_metadata.top_p,
+)</code></pre>
+
+<p>这段说明两个重要事实。第一,即使 batch 内有随机请求,只要不是 <code>all_random</code>,vLLM 仍先做一次 <code>argmax</code> 给 greedy 行备用。第二,top-k/top-p 的输入已经经过 temperature、min-p 等处理,但 top-k/top-p 本身和最终 random sample 仍由 <code>TopKTopPSampler</code> 再分发到不同实现。</p>
+
+<h2>算子如何串联</h2>
+<table>
+<thead><tr><th>阶段</th><th>vLLM 当前实现</th><th>是否 in-place / kernel 化</th><th>关键行</th></tr></thead>
+<tbody>
+<tr><td>FP32 logits</td><td><code>logits.to(torch.float32)</code>。</td><td>可能产生 dtype 转换 kernel 或别名,取决于输入 dtype。</td><td><code>sampler.py:90-91</code></td></tr>
+<tr><td>allowed token ids</td><td>对 bool mask 位置 <code>masked_fill_(-inf)</code>。</td><td>PyTorch in-place mask。</td><td><code>sampler.py:390-392</code></td></tr>
+<tr><td>bad words</td><td>Python 逐请求/逐 bad-word 检查当前输出前缀,命中时对单个 token slice 写 <code>-inf</code>。</td><td>不是一个按 vocab 扫描的 fused GPU kernel;逻辑在 Python 循环中驱动张量写入。</td><td><code>ops/bad_words.py:9-37</code></td></tr>
+<tr><td>logit bias</td><td>把 req/token/bias 三个稀疏数组搬到设备,执行 <code>logits[self.logits_slice] += self.bias_tensor</code>。</td><td>稀疏索引写,会影响 greedy argmax。</td><td><code>builtin.py:121-167</code></td></tr>
+<tr><td>min_tokens</td><td>尚未达到最小输出长度的请求,把 stop/EOS token 写成 <code>-inf</code>。</td><td>稀疏 <code>index_put_</code>,会影响 greedy argmax。</td><td><code>builtin.py:239-310</code></td></tr>
+<tr><td>重复惩罚</td><td>先从 prompt/output token id 生成 token presence mask,再调 <code>apply_repetition_penalties</code>;正 logit 除以 penalty,负 logit 乘以 penalty。</td><td>CUDA contiguous 时调 <code>torch.ops._C.apply_repetition_penalties_</code>,否则 PyTorch fallback。</td><td><code>model_executor/layers/utils.py:72-84</code>, <code>_custom_ops.py:360-408</code></td></tr>
+<tr><td>frequency / presence penalty</td><td>frequency 按输出 token count 扣分,presence 按输出 mask 扣分。</td><td>PyTorch broadcast subtraction。</td><td><code>model_executor/layers/utils.py:85-89</code></td></tr>
+<tr><td>temperature</td><td><code>logits.div_(temperature.unsqueeze(1))</code>;混合 batch 中 greedy 行温度小于 eps 时替换成 1 避免除 0。</td><td>in-place PyTorch div。</td><td><code>sampler.py:222-232</code></td></tr>
+<tr><td>min-p</td><td>先 softmax,再用 <code>max_prob * min_p</code> 得到阈值,低于阈值的 logits 写 <code>-inf</code>。</td><td>PyTorch softmax + mask;因为 argmax-invariant,只在随机采样路径执行。</td><td><code>builtin.py:25-118</code></td></tr>
+<tr><td>top-k/top-p</td><td><code>apply_top_k_top_p()</code> 优先在 CPU 走 PyTorch,CUDA 且有 Triton 且 batch size &gt;= 8 时走 Triton,否则 PyTorch sort。</td><td>Triton path 是一个 mask kernel;PyTorch path 会 sort/softmax/cumsum/scatter。</td><td><code>topk_topp_sampler.py:310-368</code>, <code>topk_topp_triton.py:966-1058</code></td></tr>
+<tr><td>softmax + random sample</td><td>native path 对 masked logits 再做 <code>softmax</code>,然后用 exponential random race 代替 <code>torch.multinomial</code>。</td><td>PyTorch/Torch compiled ops;不是 vLLM in-tree 两 kernel fused sampler。</td><td><code>topk_topp_sampler.py:111-130</code>, <code>topk_topp_sampler.py:394-415</code></td></tr>
+<tr><td>logprobs gather</td><td>可返回 top-k logprobs、sampled token logprob/rank,或指定 token ids 的 logprobs。</td><td><code>torch.topk</code>、<code>gather</code>、compiled count-greater-than。</td><td><code>sampler.py:146-220</code>, <code>sampler.py:303-351</code></td></tr>
+</tbody>
+</table>
+
+<h3>top-k/top-p 实现分叉</h3>
+<pre class="mermaid">
+flowchart TD
+  A["TopKTopPSampler.__init__"] --> B{"CUDA + logprobs_mode 不要求 processed logits/logprobs?"}
+  B -- yes --> C{"VLLM_USE_FLASHINFER_SAMPLER?"}
+  C -- yes --> D["forward_cuda: FlashInfer sampling<br/>topk_topp_sampler.py:132-157"]
+  C -- no --> E["forward_native"]
+  B -- no --> F{"CPU/XPU/ROCm?"}
+  F -- CPU --> G["forward_cpu<br/>topk_topp_sampler.py:159-187"]
+  F -- XPU --> H["torch.ops.vllm.xpu_topk_topp_sampler<br/>topk_topp_sampler.py:251-297"]
+  F -- ROCm --> I["aiter path if enabled, currently falls back<br/>topk_topp_sampler.py:189-212"]
+  F -- other --> E
+  E --> J{"k or p active?"}
+  J -- no --> K["softmax + random_sample only"]
+  J -- yes --> L{"HAS_TRITON and B &gt;= 8?"}
+  L -- yes --> M["Triton mask kernel<br/>topk_topp_triton.py:1041-1058"]
+  L -- no --> N["PyTorch sort/topk mask<br/>topk_topp_sampler.py:327-391"]
+  M --> O["softmax + exponential race<br/>topk_topp_sampler.py:123-130,394-415"]
+  N --> O
+</pre>
+
+<p>Triton 版本的注释说明 top-k 先按 logit value 应用,top-p 再对剩下的 k 个值按 probability 应用,见 <code>topk_topp_triton.py:966-977</code>。kernel 最后一段只把未保留 token 写成 <code>MASK_VALUE</code>,见 <code>topk_topp_triton.py:934-963</code>;因此 native path 后续还要重新 softmax 才能 random sample。</p>
+
+<h2>Logits Processor 机制</h2>
+<p>V1 logits processor 不是每个请求临时拼一串 Python 函数,而是在 persistent batch 里维护有状态 processor。batch 发生 add/remove/move 时,InputBatch 生成 <code>BatchUpdate</code>,依次调用所有 processor 的 <code>update_state()</code>,再重建 metadata,见 <code>gpu_input_batch.py:820-829</code>。</p>
+
+<table>
+<thead><tr><th>接口/组件</th><th>作用</th><th>关键行</th></tr></thead>
+<tbody>
+<tr><td><code>LogitsProcessor</code></td><td>定义 <code>validate_params()</code>、<code>apply()</code>、<code>is_argmax_invariant()</code>、<code>update_state()</code>。其中 <code>is_argmax_invariant()</code> 直接决定它在 greedy 前还是 random-only 阶段运行。</td><td><code>logits_processor/interface.py:60-106</code></td></tr>
+<tr><td><code>LogitsProcessors</code></td><td>构造时把 processor 拆成 <code>argmax_invariant</code> 和 <code>non_argmax_invariant</code> 两个列表。</td><td><code>logits_processor/state.py:148-165</code></td></tr>
+<tr><td>内置 processor</td><td>普通模式内置 <code>MinTokensLogitsProcessor</code>、<code>LogitBiasLogitsProcessor</code>、<code>MinPLogitsProcessor</code>。</td><td><code>logits_processor/__init__.py:51-55</code></td></tr>
+<tr><td>插件 / 自定义 processor</td><td>支持 entry point group <code>vllm.logits_processors</code>,也支持用户传 FQCN <code>module:Class</code>;加载后要求 subclass <code>LogitsProcessor</code>。</td><td><code>logits_processor/__init__.py:49-102</code>, <code>logits_processor/__init__.py:105-200</code></td></tr>
+<tr><td>spec decode 限制</td><td>spec decode 下只允许带 <code>apply_with_spec_decode</code> 支持的 processor 列表:MinTokens、LogitBias、Reasoning;min-p 在 <code>SamplingParams.verify()</code> 中直接禁止。</td><td><code>logits_processor/__init__.py:57-66</code>, <code>sampling_params.py:780-800</code></td></tr>
+<tr><td><code>AdapterLogitsProcessor</code></td><td>把旧式 per-request logits processor 包装成 batch processor,为每个 req index 保存 partial,apply 时逐行调用。</td><td><code>logits_processor/__init__.py:326-433</code></td></tr>
+</tbody>
+</table>
+
+<h3>argmax-invariant 的调度决策</h3>
+<pre class="mermaid">
+flowchart TD
+  A["processor.is_argmax_invariant()"] --> B{"会改变 greedy argmax 吗?"}
+  B -- yes --> C["non_argmax_invariant"]
+  B -- no --> D["argmax_invariant"]
+  C --> E["allowed/bad words 后,penalties 前执行<br/>sampler.py:398-403"]
+  D --> F["temperature 后,top-k/top-p 前执行<br/>sampler.py:270-286"]
+  E --> G["影响 greedy 和 random"]
+  F --> H["只影响 random path"]
+</pre>
+
+<table>
+<thead><tr><th>Processor</th><th>分类</th><th>做什么</th><th>关键行</th></tr></thead>
+<tbody>
+<tr><td><code>MinPLogitsProcessor</code></td><td>argmax-invariant</td><td>softmax 得到概率,用最大概率乘 <code>min_p</code> 得阈值,低于阈值的 logits 写 <code>-inf</code>。源码注释明确 min-p 不影响 greedy。</td><td><code>builtin.py:25-118</code></td></tr>
+<tr><td><code>LogitBiasLogitsProcessor</code></td><td>non-argmax-invariant</td><td>把每个请求的 token bias 加到 logits 上。它可以改变 argmax,所以必须在 greedy 前执行。</td><td><code>builtin.py:121-167</code></td></tr>
+<tr><td><code>MinTokensLogitsProcessor</code></td><td>non-argmax-invariant</td><td>对未达到 <code>min_tokens</code> 的请求屏蔽 stop/EOS token。</td><td><code>builtin.py:239-310</code></td></tr>
+<tr><td><code>ReasoningLogitsProcessor</code></td><td>non-argmax-invariant</td><td>当请求处于 reasoning block 内,屏蔽非 reasoning end 的特殊 token。它在 spec decode 白名单中,普通模式需要作为自定义 processor 传入才会被加载。</td><td><code>builtin.py:407-632</code>, <code>logits_processor/__init__.py:62-66</code></td></tr>
+</tbody>
+</table>
+
+<h2>Spec Decode 的 rejection sampler</h2>
+<p>spec decode 不是直接复用普通 <code>Sampler.sample()</code>。<code>RejectionSampler.forward()</code> 先对 bonus logits 调普通 sampler,强制 <code>max_num_logprobs=-1</code> 并按 logprobs mode override 返回 logits/logprobs,见 <code>rejection_sampler.py:119-140</code>。然后它取 target logits,转 FP32,应用 spec decode 版本的 processors/penalties/allowed/bad words,再做 temperature/top-k/top-p 约束和 rejection sample,见 <code>rejection_sampler.py:143-178</code>。</p>
+
+<pre class="mermaid">
+flowchart TD
+  A["target model logits<br/>[draft_tokens + batch, vocab]"] --> B["bonus_logits = logits[bonus_indices]"]
+  B --> C["Sampler(bonus_logits, predict_bonus_token=True)<br/>rejection_sampler.py:127-140"]
+  A --> D["raw_target_logits = logits[target_indices].to(float32)<br/>rejection_sampler.py:143-149"]
+  D --> E["apply_logits_processors for spec decode<br/>penalties/allowed/bad_words/non-argmax processors<br/>rejection_sampler.py:282-342"]
+  E --> F["apply_sampling_constraints<br/>temperature expand + top-k/top-p<br/>rejection_sampler.py:504-559"]
+  F --> G["rejection_sample<br/>rejection_sampler.py:390-501"]
+  G --> H{"greedy rows?"}
+  H -- yes --> I["target_argmax + rejection_greedy_sample_kernel<br/>rejection_sampler.py:448-464,704-757"]
+  H -- no --> J["target_probs = softmax<br/>sample_recovered_tokens_kernel<br/>rejection_random_sample_kernel"]
+  J --> K["output_token_ids<br/>accepted + recovered + bonus"]
+  I --> K
+</pre>
+
+<table>
+<thead><tr><th>阶段</th><th>说明</th><th>关键行</th></tr></thead>
+<tbody>
+<tr><td>spec logits processors</td><td>为了把 request-level 参数扩展到每个 draft token,row index 由 <code>repeat_interleave(num_draft_tokens)</code> 生成;allowed mask、penalties、thinking budget 使用该 repeat index。</td><td><code>rejection_sampler.py:302-324</code></td></tr>
+<tr><td>bad words with drafts</td><td><code>apply_bad_words_with_drafts()</code> 按 draft row 遍历,每一行用对应 request 的历史 tokens 检查 bad-word 前缀。</td><td><code>rejection_sampler.py:326-330</code>, <code>ops/bad_words.py:39-58</code></td></tr>
+<tr><td>sampling constraints</td><td>非 all-greedy 时,把 batch 级 temperature/top-k/top-p 扩展成 token 级向量,再调用同一套 <code>apply_top_k_top_p()</code>。注释也提示当前 top-k/top-p 的 sorting path 可能慢。</td><td><code>rejection_sampler.py:504-559</code></td></tr>
+<tr><td>greedy rejection</td><td>greedy 行比较 draft token 和 target argmax;全接受则追加 bonus token。</td><td><code>rejection_sampler.py:448-464</code>, <code>rejection_sampler.py:704-757</code></td></tr>
+<tr><td>random rejection</td><td>先对 target logits softmax,再按 <code>target_prob / draft_prob</code> 接受 draft;拒绝时使用 recovered token。</td><td><code>rejection_sampler.py:466-501</code>, <code>rejection_sampler.py:760-825</code></td></tr>
+<tr><td>recovered token</td><td>构造每请求一行 exponential random,在 Triton kernel 中对 <code>max(target - draft, 0)</code> 或 no-draft-probs 情况下的 target distribution 做 argmax race。</td><td><code>rejection_sampler.py:657-701</code>, <code>rejection_sampler.py:851-919</code></td></tr>
+</tbody>
+</table>
+
+<h2>与 HPC-Ops fused_sampler 对比</h2>
+<div class="box">对比边界:HPC-Ops 侧本文只采用任务描述里的已知点:它把温度、top-k、top-p、重复惩罚、softmax 融合为 2 个 kernel。由于指定只读源码树中没有可引用的 <code>HPC-Ops/fused_sampler</code> 实现,下表不写 HPC-Ops 的参数签名、线程布局、随机数策略或边界行为。</div>
+
+<table>
+<thead><tr><th>维度</th><th>vLLM V1 当前源码</th><th>HPC-Ops fused_sampler 前提</th><th>性能/工程含义</th></tr></thead>
+<tbody>
+<tr><td>融合范围</td><td>重复惩罚、frequency/presence penalty、temperature、min-p、top-k/top-p、softmax、random sample 分散在多个 Python/Torch/custom-op/Triton/FlashInfer 路径中。</td><td>温度、top-k、top-p、重复惩罚、softmax 收敛到 2 个 kernel。</td><td>HPC-Ops 更像 decode hot path 专用 fused kernel,减少全 vocab 多次读写和 launch 数;vLLM 更像功能组合框架。</td></tr>
+<tr><td>重复惩罚</td><td>vLLM 先构造 prompt/output token mask,再走 <code>apply_repetition_penalties_</code>;frequency/presence penalty 是后续 PyTorch broadcast 减法。</td><td>重复惩罚在 fused sampler 内部完成。</td><td>HPC-Ops 可以避免 penalty 后再把完整 logits 写回全局内存;但若要支持 vLLM 的 frequency/presence/bad words 等,还需要额外策略。</td></tr>
+<tr><td>top-k/top-p</td><td>Triton path 只负责 mask logits;native path 之后仍 softmax + random sample。PyTorch fallback 会 sort、softmax、cumsum、scatter。</td><td>top-k/top-p 与 softmax 同属 fused sampler 范围。</td><td>vLLM 的 top-k/top-p 已经有专门优化,但没有把后续 softmax/sample 合并到同一个 in-tree kernel。</td></tr>
+<tr><td>softmax</td><td>普通 native random path 在 top-k/top-p 之后执行 <code>logits.softmax(dim=-1)</code>;min-p 也会额外 softmax 一次。</td><td>softmax 与过滤融合。</td><td>HPC-Ops 对常见 random decode 可减少 softmax 前后的中间 tensor;vLLM 为 logprobs、min-p 和多 backend 保留了更清晰的阶段边界。</td></tr>
+<tr><td>greedy/mixed batch</td><td>vLLM 支持同一 batch 混合 greedy/random。非 all-random 时先算 greedy,随机采样后用 <code>torch.where(temp &lt; eps, greedy, random)</code> 合并。</td><td>题目未说明 mixed greedy/random 行为。</td><td>vLLM 的 batch 级异构参数增加了分支和 metadata 成本;专用 fused sampler 往往需要先定义支持的异构范围。</td></tr>
+<tr><td>logits processor</td><td>支持内置和自定义 processor,按 argmax-invariant 拆成 greedy 前和 random-only 两段;还要维护 persistent batch 状态。</td><td>题目给定融合项不包含 logits processor。</td><td>这是 vLLM 不容易直接替换成固定 fused kernel 的主要原因之一:用户可插入任意 logits 变换。</td></tr>
+<tr><td>allowed/bad words/structured output</td><td>structured output bitmask 在 sampler 前应用;allowed ids、bad words 在 sampler 内执行。</td><td>题目给定融合项不包含这些约束。</td><td>如果融合 kernel 只覆盖 hot path,这些功能可能需要前置 mask 或 fallback。</td></tr>
+<tr><td>spec decode</td><td>spec decode 有独立 rejection sampler,包含 bonus token 普通采样、target constraints、greedy/random rejection Triton kernels、recovered token kernel。</td><td>题目给定融合项不包含 rejection sampling。</td><td>HPC-Ops fused_sampler 可以优化普通 decode,但不能自动替代 vLLM spec decode 的 acceptance/recovery 流程。</td></tr>
+<tr><td>可维护性</td><td>功能点显式拆分,每个 processor/constraint 可单独插拔、校验和 fallback。</td><td>固定融合核更集中。</td><td>vLLM 的实现更利于覆盖 OpenAI API 兼容、插件和多平台;HPC-Ops 的方向更利于压低 decode 末端延迟。</td></tr>
+</tbody>
+</table>
+
+<h3>普通随机采样的 kernel/算子视角</h3>
+<pre><code>vLLM native CUDA path, 有 penalties + top-k/top-p + random:
+  logits.to(float32)
+  allowed/bad words/logit processors
+  apply_repetition_penalties_ custom op
+  frequency/presence PyTorch ops
+  greedy argmax if mixed batch
+  temperature div_
+  min_p softmax + mask, if enabled
+  top-k/top-p Triton mask, if B >= 8 and native path
+  softmax
+  exponential random
+  div + argmax
+  optional logprobs topk/gather/count
+
+HPC-Ops fused_sampler premise:
+  kernel 1/2: repetition penalty + temperature/top-k/top-p/softmax 的部分融合
+  kernel 2/2: 剩余采样后处理
+  exact split: 本文不推断,以 HPC-Ops 源码为准。</code></pre>
+
+<h2>关键代码片段</h2>
+<h3>1. Sampler.forward 的整体骨架</h3>
+<pre><code class="language-python"># vllm/v1/sample/sampler.py:79-104
+num_logprobs = sampling_metadata.max_num_logprobs
+raw_logprobs: torch.Tensor | None = None
+if num_logprobs is not None or sampling_metadata.logprob_token_ids:
+    if logprobs_mode == "raw_logprobs":
+        raw_logprobs = self.compute_logprobs(logits)
+    elif logprobs_mode == "raw_logits":
+        ...
+
+logits = logits.to(torch.float32)
+
+logits = self.apply_logits_processors(
+    logits, sampling_metadata, predict_bonus_token
+)
+sampled, processed_logprobs = self.sample(logits, sampling_metadata)</code></pre>
+
+<h3>2. penalties 的真实顺序</h3>
+<pre><code class="language-python"># vllm/model_executor/layers/utils.py:72-89
+num_seqs, vocab_size = logits.shape
+_, prompt_mask = get_token_bin_counts_and_mask(
+    prompt_tokens_tensor, vocab_size, num_seqs
+)
+output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+    output_tokens_tensor, vocab_size, num_seqs
+)
+
+from vllm._custom_ops import apply_repetition_penalties
+
+apply_repetition_penalties(logits, prompt_mask, output_mask, repetition_penalties)
+
+logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
+logits -= presence_penalties.unsqueeze(dim=1) * output_mask
+return logits</code></pre>
+
+<h3>3. top-k/top-p native path</h3>
+<pre><code class="language-python"># vllm/v1/sample/ops/topk_topp_sampler.py:123-130
+logits = apply_top_k_top_p(logits, k, p)
+logits_to_return = None
+if self.logprobs_mode == "processed_logits":
+    logits_to_return = logits
+elif self.logprobs_mode == "processed_logprobs":
+    logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+probs = logits.softmax(dim=-1, dtype=torch.float32)
+return random_sample(probs, generators), logits_to_return</code></pre>
+
+<h3>4. Triton top-k/top-p 只返回 masked logits</h3>
+<pre><code class="language-python"># vllm/v1/sample/ops/topk_topp_triton.py:1041-1058
+_topk_topp_kernel[(NUM_PROGRAMS,)](
+    logits,
+    logits.stride(0),
+    buffer,
+    percentile_to_std_table,
+    normal_cdf_to_sigma_table,
+    k_ptr,
+    p_ptr,
+    BATCH_SIZE=batch_size,
+    MASK_VALUE=mask_value,
+    VOCAB_SIZE=vocab_size,
+    BLOCK_SIZE=8192,
+    BLOCK_SIZE_TRUNC=4096,
+    TOPK_ENABLED=topk_enabled,
+    TOPP_ENABLED=topp_enabled,
+)
+
+return logits</code></pre>
+
+<h3>5. spec decode 约束再采样</h3>
+<pre><code class="language-python"># vllm/v1/sample/rejection_sampler.py:155-178
+target_logits = self.apply_logits_processors(
+    target_logits, sampling_metadata, metadata
+)
+target_logits = apply_sampling_constraints(
+    target_logits,
+    metadata.cu_num_draft_tokens,
+    sampling_metadata,
+)
+
+output_token_ids = rejection_sample(
+    metadata.draft_token_ids,
+    metadata.num_draft_tokens,
+    metadata.max_spec_len,
+    metadata.cu_num_draft_tokens,
+    draft_probs,
+    target_logits,
+    bonus_token_ids,
+    sampling_metadata,
+    synthetic_mode=self.synthetic_mode,
+    synthetic_conditional_rates=self.synthetic_conditional_rates,
+)</code></pre>
+
+<h2>阅读结论</h2>
+<ul>
+  <li><span class="ok">确认:</span> vLLM V1 的解码末端采样由 <code>SamplingParams</code>、<code>InputBatch</code>、<code>SamplingMetadata</code>、<code>Sampler</code>、<code>TopKTopPSampler</code>、<code>LogitsProcessor</code> 和可选 <code>RejectionSampler</code> 共同组成,不是单个 sampler kernel。</li>
+  <li><span class="ok">确认:</span> 重复惩罚有 custom op,top-k/top-p 有 Triton/FlashInfer/XPU/AITER/PyTorch 多后端,但普通 native path 仍把 temperature、penalty、top-k/top-p mask、softmax、random sample、logprobs gather 分成多个阶段。</li>
+  <li><span class="ok">确认:</span> logits processor 的核心设计是 <code>is_argmax_invariant()</code>:会改变 greedy argmax 的 processor 在 greedy 前执行;不改变 argmax 的 processor 只在随机路径、temperature 后执行。</li>
+  <li><span class="ok">确认:</span> HPC-Ops fused_sampler 的优化方向与 vLLM 当前实现的主要差异在于融合范围:它针对温度/top-k/top-p/重复惩罚/softmax 的 hot path 降低 launch 和内存流量;vLLM 保留了更宽的功能面和 fallback 面。</li>
+  <li><span class="warn">限制:</span> 本文没有 HPC-Ops 源码行号,也不声称其 2 个 kernel 如何切分或支持哪些 vLLM 额外功能。若要做可落地替换,下一步应逐项核对 allowed ids、bad words、logit bias、min-p、frequency/presence penalty、logprobs、per-request seed、mixed greedy/random 和 spec decode。</li>
+</ul>
+</body>
+</html>

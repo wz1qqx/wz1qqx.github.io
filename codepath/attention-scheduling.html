@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM Attention 调度与 split-kv 学习笔记</title>
+<style>
+body{font:14px/1.65 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1120px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+h1,h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em}
+h2{margin-top:2rem}
+h3{margin-top:1.4rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;overflow:auto}
+pre code{background:transparent;padding:0}
+pre.mermaid{background:#fff;border:1px solid #d0d7de;border-radius:6px;padding:16px}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.lead{color:#57606a;font-size:15px}
+.meta{color:#57606a;font-size:12px}
+.ok{color:#0a7d20;font-weight:600}
+.warn{color:#b35900;font-weight:600}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da}
+.box{border-left:4px solid #0969da;background:#f6f8fa;padding:8px 12px;margin:12px 0}
+.small{font-size:12px;color:#57606a}
+nav a{margin-right:1rem}
+</style>
+</head>
+<body>
+<nav><a href="overview.html">&larr; overview</a><a href="index.html">codepath map</a><a href="moe-backends.html">moe note</a><a href="marlin-kernel.html">marlin note</a></nav>
+
+<h1>vLLM Attention 调度与 split-kv 学习笔记</h1>
+<p class="lead">结论先行:vLLM v1 的 attention 相关“调度”分成两层。全局 <code>Scheduler</code> 只决定本步哪些 request 跑多少 token,并用 token budget、chunked prefill、running-first/waiting-next 来混排长短请求;它不直接生成 attention tile 计划。真正的 split-kv、tile scheduler metadata、prefill/decode 拆分发生在 attention backend 的 metadata builder 和 kernel wrapper 里,例如 FlashAttention-3 的 <code>scheduler_metadata</code>、FlashMLA 的 <code>tile_scheduler_metadata/num_splits</code>、Triton MLA decode 的 <code>num_kv_splits</code>。</p>
+<p class="meta">源码基准:<code>/Users/f/Documents/vllm-workspace/tasks/opt-kimi-pd/vllm-int</code> 当前工作树。本文只依据本地源码行号。HPC-Ops 侧只按题述特征讨论:Attention 动态负载调度、split-kv、Tile 均衡、长短请求混排治长尾;未把未验证的外部实现细节写成事实。</p>
+
+<h2>一句话定位</h2>
+<table>
+<thead><tr><th>问题</th><th>vLLM 源码事实</th><th>和 HPC-Ops 题述方案的关系</th></tr></thead>
+<tbody>
+<tr><td>全局 scheduler 是否有 prefill/decode 两个阶段</td><td>没有。<code>Scheduler.schedule()</code> 注释明确说 scheduler 内没有 decoding phase / prefill phase,只有每个 request 的 <code>num_computed_tokens</code> 和 <code>num_tokens_with_spec</code>,每步让前者追上后者。见 <code>vllm/v1/core/sched/scheduler.py:335-345</code>。</td><td>vLLM 的长短混排首先是 request/token-budget 粒度,不是 attention tile 粒度的全局负载均衡。</td></tr>
+<tr><td>prefill/decode 在哪里区分</td><td>GPU runner 生成 <code>CommonAttentionMetadata</code> 后,backend builder 用 query length、<code>seq_lens</code>、<code>is_prefilling</code> 等推断。MLA 还会要求 batch 被重排成 decode/short_extend/long_extend/prefill 区域。见 <code>gpu_model_runner.py:2267-2296</code>, <code>utils.py:632-646</code>, <code>mla_attention.py:1709-1715</code>。</td><td>vLLM 有混排和重排,但用于给 backend 选择 decode/prefill 计算路径;不是把所有 attention tile 统一放入一个跨请求调度队列。</td></tr>
+<tr><td><code>scheduler_metadata</code> 在哪里生成</td><td>FlashAttention backend 的 <code>FlashAttentionMetadataBuilder.build()</code> 在 FA3 且 AOT schedule 可用时调用 <code>get_scheduler_metadata()</code>; full CUDA graph 模式会把结果拷入预分配 buffer。见 <code>flash_attn.py:445-468</code>, <code>flash_attn.py:544-553</code>, <code>flash_attn_interface.py:121-173</code>。</td><td>接近 HPC-Ops 的 “kernel/tile scheduler metadata” 概念,但它是 FA3 backend 局部决策,不是 vLLM 全局 scheduler 的输出。</td></tr>
+<tr><td><code>num_splits</code> / split-kv 在哪里决策</td><td>FA3: <code>max_num_splits=0</code> 表示用 FA3 heuristic,full CUDA graph 时从 attention config 取上界。FlashMLA: decode builder 调 <code>get_mla_metadata()</code> / FP8 metadata op 产生 <code>num_splits</code>。Triton MLA: Python 依据 <code>max_seq_len//512</code> 和 SM 数计算一个全 batch 的 <code>num_kv_splits</code>。见 <code>flash_attn.py:430-443</code>, <code>flashmla.py:152-201</code>, <code>triton_mla.py:157-175</code>。</td><td>vLLM 有 split-kv,但粒度和策略随 backend 变化;不能概括为统一的 HPC-Ops 式动态 tile 均衡实现。</td></tr>
+<tr><td>DBO / ubatching 是不是 split-kv</td><td>不是。DBO 是 model executor 的 microbatch 切片,按 token slice 拆 <code>CommonAttentionMetadata</code>,阈值来自 <code>dbo_decode_token_threshold</code>/<code>dbo_prefill_token_threshold</code>。见 <code>parallel.py:196-210</code>, <code>ubatch_utils.py:38-46</code>, <code>ubatch_utils.py:63-114</code>, <code>ubatch_utils.py:134-248</code>。</td><td>它有助于执行重叠/大 batch 拆分,但不是 attention kernel 内 KV split 或 tile 负载均衡。</td></tr>
+</tbody>
+</table>
+
+<div class="box">阅读边界:本文的 “HPC-Ops” 只代表题目给出的方案关键词,即 split-kv、Tile 均衡、长短请求混排治长尾。源码证据只来自 vLLM 本地工作树;因此对比表强调“相似方向”和“源码可确认边界”,不评价 HPC-Ops 具体实现优劣。</div>
+
+<h2>两层调度模型</h2>
+<pre class="mermaid">
+flowchart TD
+  A["Requests<br/>prompt/output/spec tokens"] --> B["v1 Scheduler.schedule<br/>scheduler.py:335-345"]
+  B --> C["SchedulerOutput<br/>req_id -> num_scheduled_tokens<br/>output.py:180-207"]
+  C --> D["GPUModelRunner._update_states / _may_reorder_batch<br/>gpu_model_runner.py:1054-1077"]
+  D --> E["_prepare_inputs<br/>query_start_loc / seq_lens / slot_mapping<br/>gpu_model_runner.py:1976-2097"]
+  E --> F["CommonAttentionMetadata<br/>gpu_model_runner.py:2183-2296<br/>backend.py:352-410"]
+  F --> G{"AttentionMetadataBuilder per backend<br/>gpu_model_runner.py:2328-2397"}
+  G --> H["FlashAttentionMetadata<br/>FA3 scheduler_metadata / max_num_splits"]
+  G --> I["MLACommonMetadata<br/>decode/prefill/incoming decode"]
+  G --> J["ChunkedLocal / Cross metadata rewrite"]
+  H --> K["FA2/FA3 varlen attention kernel"]
+  I --> L["FlashMLA / Triton MLA / prefill backend"]
+  J --> M["underlying backend kernel"]
+</pre>
+
+<p>全局 scheduler 的输出字段是 request/token 级别的 <code>SchedulerOutput</code>:新请求、已缓存请求、<code>num_scheduled_tokens</code>、总 token 数、spec decode token、encoder input 和 common prefix blocks。见 <code>vllm/v1/core/sched/output.py:180-207</code>。这些字段随后被 GPU runner 转成 attention 需要的连续 token 布局。</p>
+
+<h3>Scheduler: token budget 与 chunked prefill</h3>
+<p><code>Scheduler.__init__</code> 把 <code>max_num_scheduled_tokens</code> 设置为 config 显式值,否则回退到 <code>max_num_batched_tokens</code>,见 <code>scheduler.py:106-112</code>。每步 scheduling 从 running request 开始,然后处理 waiting request。running request 的新增 token 量会被 <code>long_prefill_token_threshold</code> 和当前 token budget 裁剪,见 <code>scheduler.py:370-398</code>。waiting request 在命中本地/外部 prefix cache 后计算待跑 token;如果 chunked prefill 没开且请求超过 budget,会停止排队而不是切块,见 <code>scheduler.py:596-675</code>。</p>
+
+<pre><code class="language-python"># vllm/v1/core/sched/scheduler.py:335-345
+def schedule(self) -&gt; SchedulerOutput:
+    # NOTE(woosuk) on the scheduling algorithm:
+    # There's no "decoding phase" nor "prefill phase" in the scheduler.
+    # Each request just has the num_computed_tokens and
+    # num_tokens_with_spec. num_tokens_with_spec =
+    # len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).
+    # At each step, the scheduler tries to assign tokens to the requests
+    # so that each request's num_computed_tokens can catch up its
+    # num_tokens_with_spec. This is general enough to cover
+    # chunked prefills, prefix caching, speculative decoding,</code></pre>
+
+<p>这解释了 vLLM “长短请求混排”的第一层含义:长 prefill 不一定一次占满整步,它会被 token budget 和 threshold 切成多个 step;decode 或较短请求也可以继续被调度。但这里没有 attention tile、SM、split-kv 的计划。</p>
+
+<h3>GPU runner: 从 SchedulerOutput 到 CommonAttentionMetadata</h3>
+<p>GPU runner 先按 <code>SchedulerOutput.num_scheduled_tokens</code> 构造 token 序列和每个 request 的 cumulative query length。关键字段:</p>
+<ul>
+  <li><code>query_start_loc</code>:每个 request 在 query tensor 中的起点,见 <code>gpu_model_runner.py:1976-1983</code>。</li>
+  <li><code>seq_lens</code>:<code>num_computed_tokens + num_scheduled_tokens</code>,见 <code>gpu_model_runner.py:2088-2091</code>。</li>
+  <li><code>slot_mapping</code>:由 block table 根据 position 计算 KV cache 写入位置,见 <code>gpu_model_runner.py:2093-2097</code>。</li>
+  <li><code>is_prefilling</code>:<code>num_computed_tokens_cpu &lt; num_prompt_tokens_cpu</code>,供部分 backend 区分真实 decode 和 short extend,见 <code>gpu_model_runner.py:2267-2273</code>。</li>
+</ul>
+
+<pre><code class="language-python"># vllm/v1/worker/gpu_model_runner.py:2280-2296
+cm_base = CommonAttentionMetadata(
+    query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+    query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
+    seq_lens=self.seq_lens[:num_reqs_padded],
+    _seq_lens_cpu=seq_lens_cpu,
+    _num_computed_tokens_cpu=num_computed_tokens_cpu,
+    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+    num_reqs=num_reqs_padded,
+    num_actual_tokens=num_tokens_padded,
+    max_query_len=max_query_len,
+    max_seq_len=max_seq_len,
+    block_table_tensor=block_table_gid_0,
+    slot_mapping=slot_mapping_gid_0,
+    causal=True,
+    is_prefilling=is_prefilling,
+    positions=self.positions[:num_tokens_padded],
+)</code></pre>
+
+<p><code>CommonAttentionMetadata</code> 是 backend 间的共同输入。它定义 <code>query_start_loc</code>、<code>seq_lens</code>、<code>max_query_len</code>、<code>max_seq_len</code>、block table、slot mapping、<code>is_prefilling</code> 和 <code>seq_lens_cpu_upper_bound</code>;并提供 <code>compute_num_computed_tokens()</code> 用 <code>seq_lens - query_lens</code> 在 device 上恢复上下文长度。见 <code>vllm/v1/attention/backend.py:352-410</code> 与 <code>backend.py:457-462</code>。</p>
+
+<h2>prefill/decode 拆分路径</h2>
+<pre class="mermaid">
+flowchart TD
+  A["SchedulerOutput<br/>num_scheduled_tokens"] --> B{"backend needs reordered batch?"}
+  B -- yes --> C["reorder_batch_to_split_decodes_and_prefills<br/>utils.py:632-646"]
+  B -- no --> D["keep scheduler order"]
+  C --> E["CommonAttentionMetadata"]
+  D --> E
+  E --> F["split_decodes_and_prefills<br/>utils.py:533-602"]
+  F --> G{"query_lens <= decode_threshold?"}
+  G -- all yes --> H["all decodes"]
+  G -- first is prefill --> I["all prefills"]
+  G -- mixed --> J["decode prefix + prefill suffix"]
+  J --> K["MLACommonMetadata<br/>decode/prefill/incoming_decode"]
+  H --> K
+  I --> K
+</pre>
+
+<p>GPU runner 有一个 backend-driven reorder hook。注释说明部分 attention backend,尤其 MLA,希望按 attention 计算是 compute-bound 还是 memory-bound 来分离 request,见 <code>vllm/v1/worker/gpu_model_runner.py:1054-1077</code>。真正的 reorder helper 把 batch 分成四段:</p>
+<pre><code>decode:        num_scheduled &lt;= threshold 且不是 prefilling
+short_extend:  num_scheduled &lt;= threshold 且仍在 chunked prefill
+long_extend:   num_scheduled &gt; threshold 且仍在 chunked prefill
+prefill:       num_computed == 0</code></pre>
+<p>这段定义见 <code>vllm/v1/attention/backends/utils.py:632-646</code>。注意这里的 reorder 是为了 metadata/backend 路径判断,不是 scheduler 自身维护 phase。</p>
+
+<p>backend 再调用 <code>split_decodes_and_prefills()</code>。这个 helper 假设 batch 已重排,用 <code>query_lens</code>、<code>decode_threshold</code>、是否要求 uniform query length、是否把 short extend 当 decode 来决定边界。见 <code>vllm/v1/attention/backends/utils.py:533-602</code>。</p>
+
+<pre><code class="language-python"># vllm/model_executor/layers/attention/mla_attention.py:1709-1715
+num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+    split_decodes_and_prefills(
+        common_attn_metadata,
+        decode_threshold=self.reorder_batch_threshold,
+        require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+    )
+)</code></pre>
+
+<p>MLA 的文件头说明了为什么要拆两条路径:MLA 一般希望 prefill 走 compute-friendly approach,decode 走 data-movement-friendly approach;当前“小/大”的划分由 scheduler 标出的 prefill/decode 标签间接决定,并且源码注释说这个阈值未来应该调优,见 <code>mla_attention.py:13-21</code>。MLA builder 在 <code>num_prefills &gt; 0</code> 时构造 <code>MLACommonPrefillMetadata</code> 和 chunked context metadata,在 <code>num_decodes &gt; 0</code> 时调用 <code>_build_decode()</code>,最后组合成 <code>MLACommonMetadata</code>,见 <code>mla_attention.py:1760-1937</code> 与 <code>mla_attention.py:1938-1999</code>。</p>
+
+<h2>split-kv 与 scheduler_metadata</h2>
+<h3>FlashAttention-3: AOT scheduler metadata</h3>
+<p><code>FlashAttentionMetadata</code> 包含 <code>scheduler_metadata</code>、<code>prefix_scheduler_metadata</code> 和 <code>max_num_splits</code>,见 <code>vllm/v1/attention/backends/flash_attn.py:222-255</code>。builder 初始化时只有 FA3 会启用 AOT schedule;full CUDA graph + FA3 下预分配 <code>scheduler_metadata</code>,注释列出 FA3 scheduler metadata 中用于 <code>prepare_varlen</code>、<code>dynamic_split</code>、<code>sort_batches</code>、<code>head_swizzle</code> 的 slots,见 <code>flash_attn.py:332-374</code>。</p>
+
+<pre><code class="language-python"># vllm/v1/attention/backends/flash_attn.py:430-468
+max_num_splits = 0  # 0 means use FA3's heuristics, not CG compatible
+if (
+    self.use_full_cuda_graph
+    and self.max_cudagraph_size is not None
+    and num_actual_tokens &lt;= self.max_cudagraph_size
+):
+    max_num_splits = self.max_num_splits
+
+if envs.VLLM_BATCH_INVARIANT:
+    max_num_splits = 1
+
+def schedule(batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal):
+    ...
+    if aot_schedule:
+        return get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_seq_len,
+            ...
+            num_splits=max_num_splits,
+        )
+    return None</code></pre>
+
+<p><code>get_scheduler_metadata()</code> 只用于 FA3,最终调用 <code>torch.ops._vllm_fa3_C.get_scheduler_metadata</code>;其 <code>num_splits</code> 注释为 “Can be tuned for speed”,见 <code>vllm/vllm_flash_attn/flash_attn_interface.py:121-173</code>。FA2 wrapper 对包含 <code>scheduler_metadata</code> 与 descale 参数的组合有限制,且 <code>num_splits &gt; 1</code> 会抛 <code>NotImplementedError</code>;FA3 则把 <code>scheduler_metadata</code> 和 <code>num_splits</code> 传给 <code>torch.ops._vllm_fa3_C.fwd</code>,见 <code>flash_attn_interface.py:285-366</code>。</p>
+
+<h3>FlashMLA: tile scheduler metadata 与 num_splits</h3>
+<p>FlashMLA decode metadata 继承 <code>MLACommonDecodeMetadata</code>,额外带 <code>scheduler_metadata</code>,见 <code>vllm/v1/attention/backends/mla/flashmla.py:99-106</code>。它的 builder 设置 <code>query_len_support=UNIFORM</code> 且 <code>reorder_batch_threshold=128</code>,注释说明会把 small prefill 放到 decode pathway 处理,见 <code>flashmla.py:109-113</code>。</p>
+
+<pre><code class="language-python"># vllm/v1/attention/backends/mla/flashmla.py:152-201
+def _build_decode(...):
+    query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+    max_query_len = query_lens_cpu.max().item()
+    num_q_tokens_per_head_k = max_query_len * self.num_q_heads // 1
+    scheduler_metadata, _ = get_mla_metadata(
+        seq_lens_device,
+        num_q_tokens_per_head_k,
+        1,  # MQA for the decode path
+        is_fp8_kvcache=self.is_fp8_kvcache,
+    )
+    if self.is_fp8_kvcache:
+        tile_scheduler_metadata, num_splits = get_mla_metadata_dense_fp8(...)
+        ...
+        scheduler_metadata.tile_scheduler_metadata = tile_scheduler_metadata
+        scheduler_metadata.num_splits = num_splits
+
+    return FlashMLADecodeMetadata(..., scheduler_metadata=scheduler_metadata, ...)</code></pre>
+
+<p>非 FP8 路径的 <code>get_mla_metadata</code> 来自 FlashMLA 第三方接口;FP8 dense 路径通过 <code>torch.ops._flashmla_extension_C.get_mla_decoding_metadata_dense_fp8</code> 返回 <code>tile_scheduler_metadata</code> 和 <code>num_splits</code>,见 <code>vllm/v1/attention/ops/flashmla.py:86-120</code>。另一个 custom op wrapper 的 docstring 也说明返回值形状为 <code>tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize)</code> 和 <code>num_splits: (batch_size + 1)</code>,见 <code>vllm/_custom_ops.py:2988-3000</code>。</p>
+
+<p>forward 阶段,FlashMLA decode 从 metadata 取 scheduler metadata。FP8 KV cache 路径把 <code>tile_scheduler_metadata</code> 和 <code>num_splits</code> 传给 <code>flash_mla_with_kvcache_fp8</code>;非 FP8 路径把整个 scheduler metadata 传给 <code>flash_mla_with_kvcache</code>,见 <code>flashmla.py:274-330</code>。FP8 op wrapper 最终把这两个 tensor 传给 <code>torch.ops._flashmla_extension_C.fwd_kvcache_mla_fp8</code>,见 <code>ops/flashmla.py:123-152</code>;普通 custom op wrapper 则传给 <code>torch.ops._C.flash_mla_fwd_kvcache</code>,见 <code>_custom_ops.py:3003-3044</code>。</p>
+
+<h3>Triton MLA: Python 端全 batch num_kv_splits</h3>
+<p>Triton MLA decode 路径没有类似 FlashMLA 的 per-request <code>num_splits</code> tensor。它在 Python forward 中依据 batch 的 <code>max_seq_len</code> 算一个 <code>num_kv_splits</code>:batch invariant 强制 1;否则先按 <code>max_seq_len // 512</code> 取理想 split,再取 2 的幂,并用 <code>SM count * 2</code> 封顶。见 <code>vllm/v1/attention/backends/mla/triton_mla.py:157-175</code>。</p>
+
+<pre><code class="language-python"># vllm/v1/attention/backends/mla/triton_mla.py:157-175
+if envs.VLLM_BATCH_INVARIANT:
+    num_kv_splits = 1
+else:
+    min_work_per_split = 512
+    ideal_splits = max(1, attn_metadata.max_seq_len // min_work_per_split)
+    ideal_splits = triton.next_power_of_2(ideal_splits)
+    occupancy_multiplier = 2
+    max_splits = self._sm_count * occupancy_multiplier
+    num_kv_splits = min(ideal_splits, max_splits)</code></pre>
+
+<p>对应 Triton kernel 的 stage1 用 <code>tl.program_id(2)</code> 作为 <code>split_kv_id</code>,把当前 request 的 KV 长度均分成 <code>NUM_KV_SPLITS</code> 段,只遍历本段 KV,并把局部输出和 LSE 写到中间 buffer。见 <code>vllm/v1/attention/ops/triton_decode_attention.py:90-192</code>。stage2 再遍历所有 split,用 LSE 合并局部 softmax 输出,写出最终 <code>o</code> 和 <code>lse</code>,见 <code>triton_decode_attention.py:560-612</code>。调用链在 <code>decode_attention_fwd_normal()</code> / <code>decode_attention_fwd_grouped()</code> 中串起 stage1 和 stage2,见 <code>triton_decode_attention.py:657-689</code> 与 <code>triton_decode_attention.py:692-726</code>。</p>
+
+<h2>指定模块阅读</h2>
+<h3>chunked_local_attention: local window 的 virtual batch</h3>
+<p><code>ChunkedLocalAttention</code> 不是全局 scheduler 的 chunked prefill,也不是 split-kv。它把底层 attention backend 包一层,在 metadata build 前调用 <code>make_local_attention_virtual_batches()</code>,把每个原始序列按 local attention chunk 切成多个“virtual batch item”,再交给普通 flash attention backend。见 <code>vllm/model_executor/layers/attention/chunked_local_attention.py:30-78</code> 与 <code>chunked_local_attention.py:81-129</code>。</p>
+
+<p><code>make_local_attention_virtual_batches()</code> 的注释举例说明:原本一个 batch item 的 local attention mask 可以通过拆成多个 local batch item 来模拟,每个 local batch item 有自己的 q length、kv length 和 local block table。见 <code>vllm/v1/attention/backends/utils.py:195-247</code>。实现上它根据 <code>attn_chunk_size</code>、<code>query_start_loc_cpu</code>、<code>seq_lens_cpu</code> 计算 local blocks、local <code>cu_seqlens_q</code>、<code>seqlens_k_local</code>、local block table,最后返回新的 <code>CommonAttentionMetadata</code>,见 <code>utils.py:271-390</code>。</p>
+
+<h3>mla_attention: decode/prefill 双路径和 chunked context</h3>
+<p><code>MLACommonMetadata</code> 明确记录 <code>num_decodes</code>、<code>num_decode_tokens</code>、<code>num_prefills</code>、<code>num_incoming_decodes</code>,并持有 <code>prefill</code>、<code>decode</code>、<code>incoming_decode_metadata</code> 三类子 metadata,见 <code>vllm/model_executor/layers/attention/mla_attention.py:1352-1389</code>。prefill 子 metadata 可包含 chunked context metadata,包括 <code>cu_seq_lens</code>、chunk start、每 chunk 总 token、workspace、token-to-seq 映射等,见 <code>mla_attention.py:1307-1340</code>。</p>
+
+<p>MLA 对 chunked prefill 的处理是 context workspace 分块:当 prefill 有历史 context 时,它把每个 prefill 的 context 按 workspace 上限切 chunk,当前实现给每个带 context 的 prefill 分配相等 workspace,源码注释也说可以用更高级算法给长 context 更多 workspace。见 <code>mla_attention.py:1761-1784</code>。这和 HPC-Ops 题述的“Tile 均衡”方向相关,但源码中这里还不是动态 tile 均衡策略,而是 prefill context gather/compute 的 chunk metadata。</p>
+
+<h3>cross_attention: encoder-decoder metadata 改写</h3>
+<p><code>CrossAttentionBuilder</code> 复用底层 backend,但 build 时会复制 common metadata 并改成 cross-attention 语义:设置 <code>causal=False</code>,把 <code>max_seq_len</code> 改为 encoder 最大长度;用 <code>seq_lens_cpu_upper_bound - query_lens</code> 判断已有 cache 的 decode row;对这些 decode row 把 <code>encoder_seq_lens_cpu</code> 置 0,避免重复 reshape/cache;然后把 <code>seq_lens</code> 改成 encoder seq lens,并用 cross KV cache 的 block table 重新计算 slot mapping。见 <code>vllm/model_executor/layers/attention/cross_attention.py:81-131</code>。</p>
+<p><code>CrossAttention</code> 选择 underlying backend 时显式传 <code>attn_type=AttentionType.ENCODER_DECODER</code>,并返回 <code>CrossAttentionSpec</code> 作为 KV cache spec,见 <code>cross_attention.py:216-240</code>。这条路径主要是 encoder-decoder KV cache 语义调整,不是 split-kv 调度。</p>
+
+<h2>DBO / ubatching: 执行切片不是 tile scheduling</h2>
+<p>DBO 配置位于 <code>ParallelConfig</code>:<code>enable_dbo</code>、<code>ubatch_size</code>、decode 阈值 32、prefill 阈值 512,见 <code>vllm/config/parallel.py:196-210</code>。<code>check_ubatch_thresholds()</code> 根据 batch 是否 uniform decode 选择 decode/prefill 阈值,见 <code>vllm/v1/worker/ubatch_utils.py:38-46</code>。</p>
+<p><code>maybe_create_ubatch_slices()</code> 按 cumulative scheduled tokens 计算 token split points,并把每个 token slice 映射到 request slice,见 <code>ubatch_utils.py:63-114</code>。<code>_make_metadata_with_slice()</code> 会修正被切开的首尾 request 的 <code>query_start_loc</code>、<code>seq_lens</code>、block table、slot mapping 等,生成每个 ubatch 的 <code>CommonAttentionMetadata</code>,见 <code>ubatch_utils.py:134-248</code>。GPU runner 在 execute path 中创建 ubatch slices,再传给 <code>_build_attention_metadata()</code> 和 <code>set_forward_context()</code>,见 <code>gpu_model_runner.py:4082-4088</code> 与 <code>gpu_model_runner.py:4166-4224</code>。</p>
+
+<p>所以 DBO 和 HPC-Ops 题述 “长短请求混排治长尾”有目标相近的一面:都在避免大工作量阻塞小工作量。但 DBO 是模型执行 microbatch 粒度,不是 attention KV split 或 tile-level load balancer。</p>
+
+<h2>HPC-Ops 题述方案 vs vLLM 现状</h2>
+<table>
+<thead><tr><th>维度</th><th>HPC-Ops 题述方案</th><th>vLLM 源码现状</th><th>证据/边界</th></tr></thead>
+<tbody>
+<tr><td>全局目标</td><td>Attention 动态负载调度,通过 split-kv、Tile 均衡、长短请求混排降低长尾。</td><td>vLLM 分层处理:全局 scheduler 负责 request/token budget;attention backend 负责各自 kernel metadata 和 split-kv。</td><td><code>scheduler.py:335-345</code> 明确 scheduler phase-neutral;backend metadata 从 <code>gpu_model_runner.py:2328-2397</code> 分发。</td></tr>
+<tr><td>长 prefill 处理</td><td>题述为长短请求混排治长尾。</td><td>running/waiting request 都会受 token budget 和 <code>long_prefill_token_threshold</code> 限制;chunked prefill 开启时等待队列中的长 prompt 可按 budget 切步。</td><td><code>scheduler.py:391-398</code>, <code>scheduler.py:661-675</code>。这是 token step 粒度,不是 tile 粒度。</td></tr>
+<tr><td>prefill/decode 分类</td><td>题述关注长短请求混排。</td><td>scheduler 不维护 phase;backend 通过 <code>query_lens</code>、<code>seq_lens</code>、<code>is_prefilling</code> 和 reorder threshold 分类。MLA/FlashMLA 会把 short prefill 或 uniform decode 归入 decode path。</td><td><code>utils.py:533-602</code>, <code>utils.py:632-646</code>, <code>flashmla.py:109-113</code>。</td></tr>
+<tr><td>split-kv 决策</td><td>题述强调 split-kv。</td><td>存在多个 backend-local split-kv 策略:FA3 可用内部 heuristic/AOT scheduler;FlashMLA 由 metadata op 生成 <code>num_splits</code>;Triton MLA 用全 batch <code>max_seq_len</code> 算固定 split 数。</td><td><code>flash_attn.py:430-468</code>, <code>flashmla.py:152-201</code>, <code>triton_mla.py:157-175</code>。</td></tr>
+<tr><td>Tile 均衡</td><td>题述强调 Tile 均衡。</td><td>FA3 scheduler metadata 注释包含 dynamic_split/sort_batches/head_swizzle;FlashMLA metadata 包含 tile scheduler metadata。vLLM Python 层没有统一 tile scheduler,更多是委托 FA3/FlashMLA custom op。</td><td><code>flash_attn.py:354-359</code>, <code>_custom_ops.py:2994-2997</code>。具体 tile 分配算法在 C++/外部 op 内,本文不臆造。</td></tr>
+<tr><td>混合长短请求</td><td>题述通过混排减少长尾。</td><td>vLLM 有三种相关机制:global token budget/chunked prefill;backend reorder decode/short_extend/long_extend/prefill;DBO ubatch 按 token slice 拆执行。</td><td><code>scheduler.py:335-398</code>, <code>utils.py:632-646</code>, <code>ubatch_utils.py:63-114</code>。三者粒度不同。</td></tr>
+<tr><td>统一性</td><td>题述听起来像一个 attention 调度方案。</td><td>vLLM 是 backend 多态:FlashAttention、FlashMLA、Triton MLA、chunked local、cross attention 的 metadata build 都不同。</td><td><code>gpu_model_runner.py:2328-2397</code> 按每个 attention group 的 builder build metadata。</td></tr>
+<tr><td>common prefix / cascade</td><td>题述未提。</td><td>vLLM FlashAttention 有 cascade attention,利用 common prefix blocks 优化共享前缀,但这是 common-prefix 优化,不等同于长尾 split-kv 调度。</td><td><code>SchedulerOutput.num_common_prefix_blocks</code> 见 <code>output.py:205-207</code>;FA build 中 prefix/suffix schedule 见 <code>flash_attn.py:510-534</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>关键调用链</h2>
+<h3>1. request/token 调度到 attention metadata</h3>
+<pre><code>Scheduler.schedule()
+  scheduler.py:335-345
+  -&gt; num_scheduled_tokens, scheduled_new_reqs, scheduled_cached_reqs
+     output.py:180-207
+  -&gt; GPUModelRunner._may_reorder_batch()
+     gpu_model_runner.py:1054-1077
+  -&gt; _prepare_inputs()
+     query_start_loc: gpu_model_runner.py:1976-1983
+     seq_lens:        gpu_model_runner.py:2088-2091
+     slot_mapping:    gpu_model_runner.py:2093-2097
+  -&gt; _build_attention_metadata()
+     CommonAttentionMetadata: gpu_model_runner.py:2280-2296
+  -&gt; builder.build(...)
+     gpu_model_runner.py:2328-2397
+  -&gt; Attention layer reads ForwardContext
+     attention.py:648-688</code></pre>
+
+<h3>2. FA3 scheduler metadata 到 kernel</h3>
+<pre><code>FlashAttentionMetadataBuilder.build()
+  -&gt; decide max_num_splits
+     flash_attn.py:430-443
+  -&gt; get_scheduler_metadata(...)
+     flash_attn.py:445-468
+     flash_attn_interface.py:121-173
+  -&gt; copy to full-CG persistent buffer when needed
+     flash_attn.py:544-553
+  -&gt; FlashAttentionMetadata.scheduler_metadata/max_num_splits
+     flash_attn.py:555-574
+  -&gt; flash_attn_varlen_func(... scheduler_metadata, num_splits)
+     flash_attn_interface.py:326-366</code></pre>
+
+<h3>3. MLA decode split-kv</h3>
+<pre><code>MLACommonMetadataBuilder.build()
+  -&gt; split_decodes_and_prefills(...)
+     mla_attention.py:1709-1715
+     utils.py:533-602
+  -&gt; _build_decode(...)
+     mla_attention.py:1938-1963
+  -&gt; FlashMLA:
+       get_mla_metadata / get_mla_metadata_dense_fp8
+       flashmla.py:152-201
+       forward passes tile_scheduler_metadata / num_splits
+       flashmla.py:274-330
+  -&gt; Triton MLA:
+       compute global num_kv_splits
+       triton_mla.py:157-175
+       stage1 split_kv_id = tl.program_id(2)
+       triton_decode_attention.py:90-192
+       stage2 merge all splits
+       triton_decode_attention.py:560-612</code></pre>
+
+<h2>阅读结论</h2>
+<ul>
+  <li><span class="ok">确认:</span> vLLM 现状不是一个统一的 “Attention 动态负载调度器”,而是全局 token scheduler + per-backend attention metadata/kernel scheduler 的组合。</li>
+  <li><span class="ok">确认:</span> vLLM 已经有多处和 HPC-Ops 题述方向相似的机制:chunked prefill 降低长请求 head-of-line blocking;MLA/FlashMLA 按 decode/prefill 走不同路径;FA3/FlashMLA/Triton MLA 都存在 split 或 tile metadata。</li>
+  <li><span class="warn">边界:</span> vLLM 的 split-kv 决策不是一个全局统一策略。FA3 的动态 split/sort/head swizzle 在 FA3 op metadata 内,FlashMLA 的 tile scheduler 在 FlashMLA metadata op 内,Triton MLA 是 Python 端按 batch 最大长度给全 batch 一个 split 数。</li>
+  <li><span class="warn">边界:</span> DBO/ubatching 和 chunked local attention 容易被误读。前者是 model executor microbatch 切片,后者是 local attention virtual batch 改写;两者都不是 HPC-Ops 题述意义上的 attention tile load balancing。</li>
+  <li><span class="ok">对照结论:</span> 如果把 HPC-Ops 看作“在 attention 层动态拆 KV、均衡 tile、混排长短请求以治长尾”的方案,那么 vLLM 当前更像是把同类问题分散到 scheduler、runner reorder、DBO、backend metadata builder 和具体 kernel 中分别处理。相同点是都有 split 和混排;不同点是 vLLM 的策略边界更 backend-local,Python 层能看到的是 metadata 和阈值,不是统一 tile 调度算法。</li>
+</ul>
+
+</body>
+</html>

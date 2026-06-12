@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM 性能优化知识库</title>
+<style>
+body{font:15px/1.7 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1080px;margin:2rem auto;padding:0 1.2rem;color:#1b1f24}
+h1{border-bottom:2px solid #0969da;padding-bottom:.3em}
+h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em;margin-top:2rem}
+h3{margin-top:1.4rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+.lead{color:#57606a;font-size:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;margin:1rem 0}
+.card{border:1px solid #d0d7de;border-radius:8px;padding:14px 16px;background:#fff}
+.card h3{margin:.2rem 0 .4rem}
+.badge{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;vertical-align:middle}
+.done{background:#e6f4ea;color:#0a7d20}.todo{background:#fff1e0;color:#b35900}.wip{background:#ddf4ff;color:#0969da}
+.tier{border-left:4px solid #0969da;padding:6px 14px;margin:8px 0;background:#f6f8fa}
+.tier b{color:#0969da}
+code{background:#f6f8fa;padding:1px 6px;border-radius:4px;font-size:13px}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left}
+th{background:#f6f8fa}
+.meta{color:#57606a;font-size:13px}
+</style>
+</head>
+<body>
+<h1>vLLM 性能优化知识库</h1>
+<p class="lead">面向真实推理负载的端到端性能工程:从给定硬件 + benchmark 下找到最优启动配置,
+到必要时优化 kernel / vLLM 已有实现。每条结论都绑定 commit / shape / GPU / flags,经 profiler 交叉验证。</p>
+<p class="meta">骨架已搭建,内容持续补充。源:workspace-harness <code>.harness/codepath/*.json</code>(git 跟踪、绑 commit),本站为生成/沉淀视图。</p>
+
+<h2>方法论:分层搜索(代价递增)</h2>
+<p>拿到一个大模型推理优化任务,先理解请求在框架中的完整流程与组网→实现 path 的映射,再在搜索空间里按代价从低到高推进:</p>
+<div class="tier"><b>Tier-1 配置搜索(便宜)</b> — 换启动 flag,路由到一条<em>已存在且更好</em>的 codepath/kernel,只需重启 + bench。多数"找最优启动配置"在这一层。</div>
+<div class="tier"><b>Tier-2 启用非默认实现</b> — 框架里有但默认没走的 path。</div>
+<div class="tier"><b>Tier-3 kernel / feature 重写(昂贵)</b> — 仅当 Tier-1/2 榨干、且有 profiler 证据支撑时才做。</div>
+<p class="meta">铁律:<b>Tier-1 必须 gate Tier-3</b>。不先确认没有现成 config 能赢,就去写新 kernel = 浪费 GPU。</p>
+
+<!-- KNOWLEDGE-MAP -->
+<h2>知识地图</h2>
+<div class="grid">
+  <div class="card">
+    <h3>CodePath 地图 <span class="badge done">已填</span></h3>
+    <p>模型组件 → vLLM 实现 → config 选中的 kernel → 可达替代,经 profiler trace 交叉验证(confirmed / log_only / config_only)。</p>
+    <p><a href="index.html">全部地图 &rarr;</a> · <a href="compare.html">跨模型对比 &rarr;</a></p>
+    <p class="meta">已收录:Kimi-K2.6(MLA + Marlin WNA16 MoE)、GLM-4.7-FP8(GQA + Cutlass FP8 MoE)</p>
+  </div>
+  <div class="card">
+    <h3>Tier-1 配置搜索 <span class="badge wip">进行中</span></h3>
+    <p>给定 config 矩阵,serve+bench+比较,输出此 benchmark+硬件下最优配置;不达标则判 Tier-3。</p>
+    <p class="meta">真实记录:GLM-4.7-FP8 扫 <code>--block-size</code>(default 20.86ms vs 32: 20.76ms,+0.48% &lt; 3% → no-win → Tier-3 justified)。更多维度(MoE backend / TP-EP 切分 / CUDA graph)待补。</p>
+  </div>
+  <div class="card">
+    <h3>方法论详解 <span class="badge todo">待补</span></h3>
+    <p>请求在 vLLM 中的完整处理流程、组网结构(Netron 式)→ 代码 path 映射、evidence_key 绑定规则、profiler 归因方法。</p>
+  </div>
+  <div class="card">
+    <h3>Kernel 任务记录 <span class="badge todo">待补</span></h3>
+    <p>Tier-3 优化任务(kernel-pilot 格式):K/R/W/G 契约、候选 lineage、microbench、e2e gate、promoted candidate。首个目标:RMSNorm / RoPE(确定性、oracle 清晰)。</p>
+  </div>
+  <div class="card">
+    <h3>更多模型 <span class="badge todo">待补</span></h3>
+    <p>DeepSeek-V3、MiniMax-M2.5(MiniMaxM2,首次 serve 失败待排查)等,丰富跨架构 codepath 对比。</p>
+  </div>
+  <div class="card">
+    <h3>硬件矩阵 <span class="badge todo">待补</span></h3>
+    <p>同模型 × 不同 GPU(H200 sm90a / B200·B300 sm100)的最优配置差异;codepath 与 evidence_key 按 compute capability 分桶。</p>
+  </div>
+</div>
+
+<h2>已收录模型速览</h2>
+<table>
+<thead><tr><th>模型</th><th>架构</th><th>decode 头号热点</th><th>地图</th></tr></thead>
+<tbody>
+<tr><td>Kimi-K2.6</td><td>MLA + WNA16 MoE</td><td>Marlin MoE 56% · NCCL 20%</td><td><a href="kimi-k2-6.html">详情</a></td></tr>
+<tr><td>GLM-4.7-FP8</td><td>GQA + FP8 MoE</td><td>NCCL 35% · Cutlass MoE 22% · GEMM 17%</td><td><a href="glm-4-7-fp8.html">详情</a></td></tr>
+</tbody>
+</table>
+<p class="meta">数据为 H200×8、decode、in1024/out256 真实 profiler trace。刷新:<code>wh pilot codepath publish --out &lt;repo&gt;/docs/codepath</code>。</p>
+</body>
+</html>

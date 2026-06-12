@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM MoE router / gating 精度与选择流程学习笔记</title>
+<style>
+body{font:14px/1.65 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1120px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+h1,h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em}
+h2{margin-top:2rem}
+h3{margin-top:1.4rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;overflow:auto}
+pre code{background:transparent;padding:0}
+pre.mermaid{background:#fff;border:1px solid #d0d7de;border-radius:6px;padding:16px}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.lead{color:#57606a;font-size:15px}
+.meta{color:#57606a;font-size:12px}
+.ok{color:#0a7d20;font-weight:600}
+.warn{color:#b35900;font-weight:600}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da}
+.box{border-left:4px solid #0969da;background:#f6f8fa;padding:8px 12px;margin:12px 0}
+.small{font-size:12px;color:#57606a}
+nav a{margin-right:1rem}
+</style>
+</head>
+<body>
+<nav><a href="overview.html">&larr; overview</a><a href="index.html">codepath map</a><a href="moe-backends.html">moe backends</a><a href="marlin-kernel.html">marlin note</a></nav>
+
+<h1>vLLM MoE router / gating 精度与选择流程学习笔记</h1>
+<p class="lead">结论先行:当前工作树里的 MoE router/gating 被拆成两层:先由模型侧 gate、<code>GateLinear</code> 或 <code>NormGateLinear</code> 生成 <code>router_logits</code>,再由 <code>create_fused_moe_router()</code> 选出的 router 把 logits 变成 <code>topk_weights</code> 和 <code>topk_ids</code>。vLLM 已经在多个精度敏感路径上把 router logits 或 top-k weights 保持为 FP32,但本地源码没有看到 HPC-Ops 题述那种“双 BF16 模拟 FP32 Router GEMM”的实现。</p>
+<p class="meta">源码基准:<code>/Users/f/Documents/vllm-workspace/tasks/opt-kimi-pd/vllm-int</code> 当前工作树。本文只依据本地源码行号;HPC-Ops 侧只按题述特征讨论,不把未验证的外部实现细节写成事实。</p>
+
+<h2>一句话定位</h2>
+<table>
+<thead><tr><th>问题</th><th>vLLM 源码事实</th></tr></thead>
+<tbody>
+<tr><td>router/gating 在 MoE 流水线的位置</td><td><code>MoERunner</code> 在 forward 中拿到 <code>hidden_states</code> 和 <code>router_logits</code>。非 monolithic quant method 先调 <code>router.select_experts()</code> 产生 <code>topk_weights/topk_ids</code>,再把它们交给 expert GEMM backend。见 <code>fused_moe/runner/moe_runner.py:514-537</code>, <code>fused_moe/runner/moe_runner.py:742-799</code>。</td></tr>
+<tr><td>router 如何选择</td><td><code>FusedMoE.__init__</code> 调 <code>create_fused_moe_router()</code>,优先级是 routing simulator、zero expert、grouped top-k、custom routing、bias/hash top-k、AITER shared-routed、默认 fused top-k。见 <code>fused_moe/layer.py:296-317</code>, <code>router/router_factory.py:63-75</code>, <code>router/router_factory.py:113-222</code>。</td></tr>
+<tr><td>top-k 输出精度</td><td>默认 fused top-k、bias top-k、grouped top-k 都把 <code>topk_weights</code> 分配或返回为 <code>torch.float32</code>;indices 默认为 int32,也可由 modular kernel 指定 dtype。见 <code>router/fused_topk_router.py:81-92</code>, <code>router/fused_topk_bias_router.py:261-272</code>, <code>csrc/moe/grouped_topk_kernels.cu:1029-1033</code>, <code>router/base_router.py:215-223</code>。</td></tr>
+<tr><td>router logits 精度</td><td>模型侧可传普通 <code>ReplicatedLinear</code>/<code>nn.Linear</code> logits,也可使用 <code>GateLinear</code>/<code>NormGateLinear</code>。精度敏感模型会显式要求 FP32 logits,例如 DSV4、GLM4-MoE、Nemotron-H、Gemma4。见 <code>router/gate_linear.py:92-117</code>, <code>router/norm_gate_linear.py:19-36</code>, <code>vllm/models/deepseek_v4/nvidia/model.py:748-763</code>, <code>model_executor/models/glm4_moe.py:146-210</code>。</td></tr>
+<tr><td>和 expert backend 的关系</td><td>router 只决定 token 到专家的映射和权重;expert backend 选择仍在 quant method / oracle 中进行。<code>routing_method_type</code> 和 <code>router_logits_dtype</code> 会写入 <code>FusedMoEConfig</code>,随后由 backend 的 <code>is_supported_config()</code> 检查。见 <code>fused_moe/layer.py:318-341</code>, <code>fused_moe/config.py:100-167</code>, <code>fused_moe/modular_kernel.py:536-582</code>。</td></tr>
+</tbody>
+</table>
+
+<div class="box">边界:题述 HPC-Ops Router GEMM 的关键词是“双 BF16 模拟 FP32、MoE router 精度敏感”。vLLM 本地源码能确认的是 BF16 input/weight 可产生 FP32 logits、top-k weights 为 FP32、模型侧有强制 FP32 router 的路径;不能确认 vLLM 使用了双 BF16 拆分/补偿来模拟 FP32 累加。</div>
+
+<h2>端到端数据流</h2>
+<pre class="mermaid">
+flowchart TD
+  A["hidden_states<br/>[tokens, hidden]"] --> B{"router logits 在哪里算?"}
+  B -- "模型 forward 外部计算" --> C["ReplicatedLinear / nn.Linear / GateLinear / NormGateLinear"]
+  B -- "runner 持有 gate" --> D["MoERunner._forward_impl 调 gate<br/>moe_runner.py:771-776"]
+  C --> E["router_logits<br/>[tokens, experts]"]
+  D --> E
+  E --> F["_maybe_dispatch hidden_states + router_logits<br/>moe_runner.py:686-718"]
+  F --> G{"quant method is_monolithic?"}
+  G -- yes --> H["apply_monolithic(router_logits)<br/>backend 自己处理 routing"]
+  G -- no --> I["router.select_experts()<br/>base_router.py:250-298"]
+  I --> J["topk_weights FP32 + topk_ids"]
+  J --> K["quant_method.apply(...)<br/>expert GEMM backend"]
+  H --> L["fused expert output"]
+  K --> L
+  L --> M["combine / shared expert / reduce"]
+</pre>
+
+<p>这条图的关键点是“router logits generation”和“top-k expert selection”不是同一层抽象。<code>GateLinear</code> 只负责 GEMM 生成 logits;<code>FusedTopKRouter</code>、<code>GroupedTopKRouter</code>、<code>FusedTopKBiasRouter</code> 只负责从 logits 选专家并生成权重。<code>DeepSeek V4 MegaMoE</code> 是例外之一,它在模型专用路径里直接调用 <code>fused_topk_bias()</code>,然后把 top-k 结果交给 MegaMoE experts,见 <code>vllm/models/deepseek_v4/nvidia/model.py:771-798</code>。</p>
+
+<h2>Router 工厂决策树</h2>
+<pre class="mermaid">
+flowchart TD
+  A["create_fused_moe_router(top_k, experts, flags)<br/>router_factory.py:39-62"] --> B{"VLLM_MOE_ROUTING_SIMULATION_STRATEGY != ''?"}
+  B -- yes --> C["RoutingSimulatorRouter"]
+  B -- no --> D{"zero_expert_type is not None?"}
+  D -- yes --> E["ZeroExpertRouter<br/>requires num_logical_experts + e_score_correction_bias"]
+  D -- no --> F{"use_grouped_topk?"}
+  F -- yes --> G["GroupedTopKRouter<br/>DeepSeek/Kimi/GLM 等分组路由"]
+  G --> H{"routing_method_type specified<br/>or group/topk_group non-trivial?"}
+  H -- yes --> Z["return GroupedTopKRouter"]
+  H -- no --> I["退化为普通 top-k"]
+  F -- no --> J{"custom_routing_function?"}
+  I --> J
+  J -- yes --> K["CustomRoutingRouter"]
+  J -- no --> L{"e_score_correction_bias<br/>or hash_indices_table?"}
+  L -- yes --> M["FusedTopKBiasRouter<br/>bias/hash/sqrtsoftplus"]
+  L -- no --> N{"AITER shared-routed fusion?"}
+  N -- yes --> O["AiterSharedRoutedFusedMoERouter"]
+  N -- no --> P["FusedTopKRouter<br/>default"]
+</pre>
+
+<table>
+<thead><tr><th>Router</th><th>何时被选</th><th>输出与后续影响</th><th>源码依据</th></tr></thead>
+<tbody>
+<tr><td><code>RoutingSimulatorRouter</code></td><td><code>VLLM_MOE_ROUTING_SIMULATION_STRATEGY</code> 非空时最先命中。</td><td>用于模拟/实验 routing;优先级高于所有模型参数。</td><td><code>router_factory.py:113-120</code></td></tr>
+<tr><td><code>ZeroExpertRouter</code></td><td><code>zero_expert_type</code> 非空。工厂要求 <code>num_logical_experts</code> 和 <code>e_score_correction_bias</code> 都存在。</td><td>除 routed expert 外还会让 runner 在最终输出上加 zero expert 贡献。</td><td><code>router_factory.py:122-140</code>, <code>moe_runner.py:576-590</code></td></tr>
+<tr><td><code>GroupedTopKRouter</code></td><td><code>use_grouped_topk=True</code>,且 <code>num_expert_group/topk_group</code> 合法。若只有 1 组、<code>topk_group=1</code> 且 routing method 未指定,工厂退化到普通 top-k。</td><td>输出分组筛选后的 <code>topk_weights/topk_ids</code>,<code>routing_method_type</code> 可能是 DeepSeekV3、RenormalizeNaive、SigmoidRenorm 等。</td><td><code>router_factory.py:142-173</code>, <code>grouped_topk_router.py:286-294</code></td></tr>
+<tr><td><code>CustomRoutingRouter</code></td><td><code>custom_routing_function</code> 非空且没有先命中 grouped top-k。Gemma4、Llama4 一类模型会走这里。</td><td>模型自己定义 logits 到 top-k 的数学规则;router 框架仍负责 EPLB mapping 和 indices dtype 转换。</td><td><code>router_factory.py:175-183</code>, <code>model_executor/models/gemma4.py:326-360</code>, <code>model_executor/models/llama4.py:72-83</code></td></tr>
+<tr><td><code>FusedTopKBiasRouter</code></td><td><code>e_score_correction_bias</code> 非空,或 <code>hash_indices_table</code> 非空。DeepSeek V4 的 hash/sqrtsoftplus 路径就在这里。</td><td>支持 softmax、sigmoid、sqrtsoftplus;bias 用于选择,hash table 可直接指定 token 到专家。</td><td><code>router_factory.py:185-198</code>, <code>fused_topk_bias_router.py:374-437</code>, <code>vllm/models/deepseek_v4/nvidia/model.py:658-763</code></td></tr>
+<tr><td><code>AiterSharedRoutedFusedMoERouter</code></td><td><code>num_fused_shared_experts &gt; 0</code>、<code>scoring_func=="softmax"</code> 且 ROCm AITER shared-expert fusion 可用。</td><td>ROCm AITER 的 shared routed fusion 特化路径。</td><td><code>router_factory.py:200-213</code></td></tr>
+<tr><td><code>FusedTopKRouter</code></td><td>以上条件都不满足时的默认 router。</td><td>标准 softmax/sigmoid top-k。</td><td><code>router_factory.py:215-222</code>, <code>fused_topk_router.py:116-165</code></td></tr>
+</tbody>
+</table>
+
+<h2>公共 select 模板</h2>
+<p>所有继承 <code>BaseRouter</code> 的 router 都共享同一个 <code>select_experts()</code> 模板。子类只实现 <code>_compute_routing()</code>;公共模板负责 EPLB 状态校验、logical id 捕获、EPLB logical-to-physical 映射和 indices dtype 转换。</p>
+
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/router/base_router.py:250-298
+def select_experts(self, hidden_states, router_logits, *, input_ids=None):
+    self._validate_eplb_state()
+    indices_type = self._get_indices_type()
+    topk_weights, topk_ids = self._compute_routing(
+        hidden_states, router_logits, indices_type, input_ids=input_ids
+    )
+    if self.capture_fn is not None:
+        self.capture_fn(topk_ids)
+    topk_ids = self._apply_eplb_mapping(topk_ids)
+    topk_ids = self._convert_indices_dtype(topk_ids, indices_type)
+    return topk_weights, topk_ids</code></pre>
+
+<p>EPLB 映射在 CUDA-like 平台上用 Triton kernel 同时完成 logical expert 到 physical expert 的映射和 load 计数记录,见 <code>base_router.py:17-125</code>。这意味着普通 router 输出的是 logical expert id;如果启用 EPLB,进入 expert backend 前会被转换成 physical expert id。</p>
+
+<h2>默认 fused top-k</h2>
+<p><code>FusedTopKRouter</code> 是最普通的 top-k 路径。它先按 token 数 M 分配三个 buffer:</p>
+<ul>
+  <li><code>topk_weights</code>: <code>[M, topk]</code>, dtype 固定为 <code>torch.float32</code>。</li>
+  <li><code>topk_ids</code>: <code>[M, topk]</code>, dtype 是 modular kernel 要求的 indices dtype,否则 int32。</li>
+  <li><code>token_expert_indices</code>: <code>[M, topk]</code>, int32,用于底层 op 的 token-expert 元数据。</li>
+</ul>
+<p>随后按 <code>scoring_func</code> 选择 softmax 或 sigmoid kernel。ROCm AITER enabled 时会切到 AITER top-k op,否则用 vLLM 自带 <code>ops.topk_softmax</code>/<code>ops.topk_sigmoid</code>。见 <code>fused_topk_router.py:69-113</code>。</p>
+
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/router/fused_topk_router.py:81-113
+topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
+topk_ids = torch.empty(M, topk, dtype=torch.int32 if indices_type is None else indices_type,
+                       device=hidden_states.device)
+token_expert_indices = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+
+if scoring_func == "softmax":
+    topk_func = dispatch_topk_softmax_func(...)
+elif scoring_func == "sigmoid":
+    topk_func = dispatch_topk_sigmoid_func(...)
+else:
+    raise ValueError(...)
+topk_weights, topk_ids = topk_func(..., gating_output, renormalize)</code></pre>
+
+<p>CUDA 侧 <code>topk_softmax()</code>/<code>topk_sigmoid()</code> 支持 <code>gating_output</code> 为 FP32/FP16/BF16,workspace 用 FP32,输出写入 Python 侧传入的 FP32 <code>topk_weights</code>。见 <code>csrc/moe/topk_softmax_kernels.cu:791-865</code>。</p>
+
+<h2>Grouped top-k 算法</h2>
+<p><code>GroupedTopKRouter</code> 服务 DeepSeek-V2/V3、Kimi、GLM4、Nemotron-H 等“先选专家组再选专家”的路由。核心函数是 <code>grouped_topk()</code>,源码注释也写明用于 DeepSeek-V2 和 DeepSeek-V3,见 <code>grouped_topk_router.py:78-84</code>。</p>
+
+<pre class="mermaid">
+flowchart TD
+  A["router_logits [M, E]"] --> B{"scoring_func"}
+  B -- softmax --> C["scores = softmax(logits)"]
+  B -- sigmoid --> D["scores = sigmoid(logits)"]
+  C --> E{"有 correction bias?"}
+  D --> E
+  E -- yes --> F["selection scores = scores + bias<br/>group score = sum(top2 per group)<br/>weights 仍从原始 scores gather"]
+  E -- no --> G["group score = max score in group"]
+  F --> H["topk_group groups"]
+  G --> H
+  H --> I["mask 非选中 group 为 -inf"]
+  I --> J["topk experts within selected groups"]
+  J --> K{"renormalize?"}
+  K -- yes --> L["weights /= sum(topk weights)"]
+  K -- no --> M["keep weights"]
+  L --> N["optional routed_scaling_factor"]
+  M --> N
+  N --> O["topk_weights FP32, topk_ids int32"]
+</pre>
+
+<p>这段算法的关键细节:</p>
+<table>
+<thead><tr><th>步骤</th><th>源码行为</th><th>行号</th></tr></thead>
+<tbody>
+<tr><td>fused CUDA 快路径</td><td>仅当 <code>VLLM_USE_FUSED_MOE_GROUPED_TOPK</code>、CUDA、<code>num_expert_group &lt;= 32</code>、<code>topk &lt;= 32</code> 且 bias 非空时走 <code>ops.grouped_topk()</code>。softmax 会先在 Python 侧算好 scores;sigmoid 把 raw logits 交给 kernel。</td><td><code>grouped_topk_router.py:32-75</code>, <code>grouped_topk_router.py:95-112</code></td></tr>
+<tr><td>bias 的选择/权重分离</td><td>有 <code>e_score_correction_bias</code> 时,biased scores 用于选 group/expert;最终 <code>topk_weights</code> 从未加 bias 的 original scores 中 gather。</td><td><code>grouped_topk_router.py:124-155</code></td></tr>
+<tr><td>group score</td><td>有 bias 时每组取 top2 求和;无 bias 时每组取 max。</td><td><code>grouped_topk_router.py:129-135</code></td></tr>
+<tr><td>确定性 top-k</td><td><code>VLLM_BATCH_INVARIANT</code> 为真时 <code>torch.topk(..., sorted=True)</code>,保证 batch invariant 场景专家选择更稳定。</td><td><code>grouped_topk_router.py:137-139</code>, <code>grouped_topk_router.py:151-158</code></td></tr>
+<tr><td>renormalize/scale</td><td>若 <code>renormalize</code> 则除以 top-k 权重和;若 <code>routed_scaling_factor != 1.0</code> 再乘 scaling factor。</td><td><code>grouped_topk_router.py:160-165</code></td></tr>
+<tr><td>输出 dtype</td><td>Python fallback 显式返回 <code>topk_weights.to(torch.float32)</code> 和 <code>topk_ids.to(torch.int32)</code>;CUDA grouped top-k 也创建 FP32 values 和 int32 indices。</td><td><code>grouped_topk_router.py:165</code>, <code>csrc/moe/grouped_topk_kernels.cu:1029-1033</code></td></tr>
+</tbody>
+</table>
+
+<p><code>GroupedTopKRouter._compute_routing()</code> 还有两个降级:如果 <code>num_experts</code> 不能按 <code>num_expert_group</code> 有效分组,它会退到 <code>fused_topk_bias()</code> 或 <code>fused_topk()</code>;如果 Kimi K2 gate fusion 条件满足,它可直接调用 <code>novita_kimi_k2_moe_fused_gate()</code>。见 <code>grouped_topk_router.py:306-355</code>。</p>
+
+<h2>Bias / hash / sqrtsoftplus top-k</h2>
+<p><code>FusedTopKBiasRouter</code> 在两种情况下被选中:存在 <code>e_score_correction_bias</code>,或存在 <code>hash_indices_table</code>。它统一调用 <code>fused_topk_bias()</code>,支持三类 scoring:</p>
+<table>
+<thead><tr><th>scoring_func</th><th>行为</th><th>精度/选择细节</th><th>源码依据</th></tr></thead>
+<tbody>
+<tr><td><code>softmax</code></td><td>调用 <code>ops.topk_softmax()</code>,可把 bias 传给底层 kernel。之后可乘 <code>routed_scaling_factor</code>。</td><td><code>topk_weights</code> 是 FP32;CUDA kernel 支持 logits 为 FP32/FP16/BF16。</td><td><code>fused_topk_bias_router.py:274-285</code>, <code>csrc/moe/topk_softmax_kernels.cu:791-827</code></td></tr>
+<tr><td><code>sigmoid</code></td><td>调用 <code>ops.topk_sigmoid()</code>,可把 bias 传给底层 kernel。ROCm AITER 有 biased grouped top-k 分支。</td><td>DeepSeekV3/noaux_tc 一类 bias 路由常走这里。Kimi K2 满足 shape/dtype 条件时可走 Novita fused gate。</td><td><code>fused_topk_bias_router.py:286-337</code>, <code>fused_topk_bias_router.py:179-224</code></td></tr>
+<tr><td><code>sqrtsoftplus</code></td><td>用于 DeepSeek V4。CUDA 走 <code>ops.topk_hash_softplus_sqrt()</code>;XPU/CPU fallback 用 PyTorch 算 <code>sqrt(softplus(logits.float()))</code>。</td><td>bias 只影响 expert 选择,权重从未加 bias 的 scores 中 gather;hash MoE 可直接按 <code>hash_indices_table[input_ids]</code> 指定 expert ids。</td><td><code>fused_topk_bias_router.py:61-104</code>, <code>fused_topk_bias_router.py:298-309</code>, <code>csrc/moe/topk_softplus_sqrt_kernels.cu:690-727</code></td></tr>
+</tbody>
+</table>
+
+<p>DeepSeek V4 NVIDIA 路径把 <code>scoring_func</code> 默认设为 <code>sqrtsoftplus</code>,hash layer 使用 <code>tid2eid</code>,非 hash/noaux_tc layer 使用 FP32 <code>e_score_correction_bias</code>,并把 <code>router_logits_dtype=torch.float32</code> 传给 <code>FusedMoE</code>。见 <code>vllm/models/deepseek_v4/nvidia/model.py:646-687</code>, <code>vllm/models/deepseek_v4/nvidia/model.py:748-763</code>。</p>
+
+<h2>GateLinear 精度路径</h2>
+<p><code>GateLinear</code> 是 vLLM 对 MoE gate projection 的专门封装。它继承 <code>ReplicatedLinear</code>,但 forward 有三层 dispatch:</p>
+<table>
+<thead><tr><th>Tier</th><th>触发条件</th><th>输出精度</th><th>源码依据</th></tr></thead>
+<tbody>
+<tr><td>1. DSV3 router GEMM</td><td>CUDA, SM90 或 Blackwell family,无 bias,并且 <code>output_size in [256,384]</code>、<code>input_size == 7168</code>、runtime <code>x.shape[0] &lt;= 16</code>。</td><td>由 <code>out_dtype</code> 决定,可为 FP32。底层 C++ 允许 output FP32 或 BF16。</td><td><code>router/gate_linear.py:38-73</code>, <code>router/gate_linear.py:97-104</code>, <code>csrc/moe/dsv3_router_gemm_entry.cu:101-130</code></td></tr>
+<tr><td>2. cuBLAS BF16 到 FP32</td><td>同样要求 specialized platform 条件,权重是 BF16,且 <code>out_dtype == torch.float32</code>,输入也是 BF16。</td><td><code>torch.mm(x, weight.T, out_dtype=torch.float32)</code>,也就是 BF16 input/weight 产生 FP32 logits。</td><td><code>router/gate_linear.py:68-73</code>, <code>router/gate_linear.py:106-109</code></td></tr>
+<tr><td>3. ReplicatedLinear fallback</td><td>其他情况。若设置 <code>force_fp32_compute</code> 且没有 specialized kernel,初始化会把参数 dtype 设成 FP32。</td><td>先按权重 dtype 做 <code>F.linear</code>,再按 <code>out_dtype</code> cast 输出。</td><td><code>router/gate_linear.py:45-57</code>, <code>router/gate_linear.py:111-117</code></td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/router/gate_linear.py:97-117
+if self.allow_dsv3_router_gemm and x.shape[0] &lt;= 16:
+    output = ops.dsv3_router_gemm(
+        hidden_states=x,
+        router_weight=self.weight,
+        output_dtype=self.out_dtype,
+    )
+    return output, None
+
+if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
+    output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+    return output, None
+
+if self.out_dtype is not None and x.dtype != self.weight.dtype:
+    x = x.to(self.weight.dtype)
+output, output_bias = super().forward(x)
+if self.out_dtype is not None and output.dtype != self.out_dtype:
+    output = output.to(self.out_dtype)
+return output, output_bias</code></pre>
+
+<p>CUDA 侧 <code>dsv3_router_gemm</code> 的约束很窄:输入和权重必须 BF16,hidden dim 固定 7168,专家数只能是 256 或 384,token 数 1 到 16,SM 要在 90 到 103,输出只能 FP32 或 BF16。见 <code>csrc/moe/moe_ops.h:69-77</code>, <code>csrc/moe/dsv3_router_gemm_entry.cu:101-130</code>。这与 HPC-Ops 题述方案的共同点是都重视 router GEMM 的精度;差异是 vLLM 这里是 BF16 GEMM 产生 FP32/BF16 输出,源码没有双 BF16 模拟 FP32 累加的代码证据。</p>
+
+<h2>NormGateLinear: DSV4 的 fused norm + gate</h2>
+<p><code>NormGateLinear</code> 是 DeepSeek V4 MoE routing 的专用层,同时持有 RMSNorm 和 <code>GateLinear</code>。它的语义是返回 <code>(normed_x, logits)</code>,其中 logits 固定 FP32。</p>
+<ul>
+  <li>DSV4-Pro shape 命中时,调用 custom op <code>torch.ops.vllm.dsv4_pro_norm_gate</code>,底层是 <code>dsv4_norm_router_gemm</code>,融合 RMSNorm 和 router GEMV。见 <code>router/norm_gate_linear.py:19-36</code>, <code>router/norm_gate_linear.py:91-108</code>。</li>
+  <li>非 Pro 或 token 数更大时,先用 <code>torch.ops._C.rms_norm</code> 或 <code>RMSNorm</code> 生成 normed tensor,再用 <code>torch.mm(..., out_dtype=torch.float32)</code> 或 <code>GateLinear</code> 生成 logits。见 <code>router/norm_gate_linear.py:32-36</code>, <code>router/norm_gate_linear.py:110-114</code>。</li>
+  <li>C++ entry 强制 DSV4 fused op 的 <code>x/norm_weight/gate_weight/normed_x</code> 为 BF16、<code>logits</code> 为 FP32、hidden 7168、experts 384、tokens 1 到 16、SM90 到 SM103。见 <code>csrc/moe/dsv4_norm_router_gemm_entry.cu:66-113</code>。</li>
+</ul>
+
+<p>DeepSeek V4 模型侧把它接入两条路径:</p>
+<table>
+<thead><tr><th>路径</th><th>代码行为</th><th>源码依据</th></tr></thead>
+<tbody>
+<tr><td>普通 FusedMoE</td><td><code>NormGateLinear</code> 产生 normed hidden states 和 FP32 logits;构造 <code>FusedMoE</code> 时传入 <code>scoring_func=sqrtsoftplus</code>、bias/hash table、<code>router_logits_dtype=torch.float32</code>。</td><td><code>vllm/models/deepseek_v4/nvidia/model.py:658-687</code>, <code>vllm/models/deepseek_v4/nvidia/model.py:748-763</code></td></tr>
+<tr><td>MegaMoE</td><td>模型 forward 里直接调用 <code>fused_topk_bias()</code> 生成 top-k,再调 <code>DeepseekV4MegaMoEExperts</code>。该路径要求 <code>moe_backend=="deep_gemm_mega_moe"</code>、expert parallel、<code>sqrtsoftplus</code> routing 和 FP4 experts。</td><td><code>vllm/models/deepseek_v4/nvidia/model.py:628-656</code>, <code>vllm/models/deepseek_v4/nvidia/model.py:771-798</code></td></tr>
+</tbody>
+</table>
+
+<h2>模型侧触发例子</h2>
+<table>
+<thead><tr><th>模型/路径</th><th>gate logits 来源</th><th>router 参数</th><th>会选到的 router</th></tr></thead>
+<tbody>
+<tr><td>DeepSeek V2/V3</td><td><code>GateLinear</code>。当 AITER biased grouped top-k 要求 correction bias dtype 匹配 logits 时,代码把 gate output dtype 设成 FP32。</td><td><code>use_grouped_topk=True</code>, <code>num_expert_group/topk_group</code>, <code>scoring_func</code>, <code>e_score_correction_bias</code>, <code>router_logits_dtype=self.gate.out_dtype</code>。</td><td>通常 <code>GroupedTopKRouter</code>。见 <code>model_executor/models/deepseek_v2.py:273-310</code>, <code>model_executor/models/deepseek_v2.py:327-351</code>。</td></tr>
+<tr><td>DeepSeek V4 NVIDIA</td><td><code>NormGateLinear</code>,DSV4-Pro 可融合 RMSNorm+router GEMV,logits FP32。</td><td><code>scoring_func=sqrtsoftplus</code>,非 hash/noaux_tc 用 FP32 bias,hash layer 用 <code>tid2eid</code>,<code>router_logits_dtype=torch.float32</code>。</td><td>普通路径是 <code>FusedTopKBiasRouter</code>;MegaMoE 路径绕过 router 对象直接调 <code>fused_topk_bias()</code>。见 <code>vllm/models/deepseek_v4/nvidia/model.py:646-687</code>, <code>vllm/models/deepseek_v4/nvidia/model.py:748-789</code>。</td></tr>
+<tr><td>GLM4-MoE</td><td><code>nn.Linear(..., dtype=torch.float32)</code>,forward 前把 hidden states cast 到 FP32。</td><td><code>use_grouped_topk=True</code>,<code>scoring_func="sigmoid"</code>,FP32 correction bias,<code>router_logits_dtype=torch.float32</code>。</td><td><code>GroupedTopKRouter</code>。见 <code>model_executor/models/glm4_moe.py:146-210</code>。</td></tr>
+<tr><td>Nemotron-H</td><td><code>GateLinear(out_dtype=torch.float32, force_fp32_compute=True)</code>。</td><td><code>use_grouped_topk=True</code>,<code>scoring_func="sigmoid"</code>,bias FP32,<code>router_logits_dtype=self.gate.out_dtype</code>,non-gated MoE。</td><td><code>GroupedTopKRouter</code>。见 <code>model_executor/models/nemotron_h.py:155-165</code>, <code>model_executor/models/nemotron_h.py:217-240</code>。</td></tr>
+<tr><td>Gemma4</td><td><code>Gemma4Router</code> 内部用 <code>GateLinear(out_dtype=torch.float32)</code>。</td><td>模型提供 <code>custom_routing_function</code>,注释说明内置 fused_topk 的 softmax 作用域不满足 Gemma4 数学语义。</td><td><code>CustomRoutingRouter</code>。见 <code>model_executor/models/gemma4.py:281-298</code>, <code>model_executor/models/gemma4.py:326-360</code>。</td></tr>
+<tr><td>Llama4</td><td><code>ReplicatedLinear</code> router。</td><td>提供 <code>custom_routing_function</code>:先 <code>fast_topk</code>,再对 selected scores 做 sigmoid,并返回 int32 indices。</td><td><code>CustomRoutingRouter</code>。见 <code>model_executor/models/llama4.py:72-83</code>, <code>model_executor/models/llama4.py:133-147</code>。</td></tr>
+<tr><td>Kimi linear MoE</td><td>普通 <code>ReplicatedLinear</code>,注释写明 gate 当前总是 half/full precision,不走 quant config。</td><td><code>use_grouped_topk=config.use_grouped_topk</code>,bias 参数 <code>e_score_correction_bias</code>,scoring 来自 config。</td><td>通常 <code>GroupedTopKRouter</code>,若配置退化则可回普通 top-k/bias top-k。见 <code>model_executor/models/kimi_linear.py:128-167</code>。</td></tr>
+<tr><td>MiniMax M2</td><td>gate 使用 FP32 params,forward 前把 hidden states cast 到 FP32;FusedMoE 明确 <code>router_logits_dtype=torch.float32</code>。</td><td>可选 <code>use_routing_bias</code>,scoring_func 来自 config。</td><td>有 bias 时 <code>FusedTopKBiasRouter</code>,否则默认或其它按工厂条件选择。见 <code>model_executor/models/minimax_m2.py:92-123</code>, <code>model_executor/models/minimax_m2.py:134-135</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>RoutingMethodType 与 backend 支持</h2>
+<p>router 创建后会把 <code>routing_method_type</code> 写进 <code>FusedMoEConfig</code>,这不是单纯的标签,后续 expert backend 会用它判断能否支持当前 routing。映射规则在 <code>get_routing_method_type()</code>:</p>
+<ul>
+  <li><code>sqrtsoftplus + renormalize</code> 对应 <code>DeepseekV4</code>。</li>
+  <li>有 bias 且 grouped sigmoid 对应 <code>DeepSeekV3</code>;有 bias 且普通 sigmoid 对应 <code>MiniMax2</code>。</li>
+  <li>无 bias sigmoid top-1 对应 <code>Llama4</code>;无 bias sigmoid + renormalize 对应 <code>SigmoidRenorm</code>。</li>
+  <li>softmax + renormalize 对应 <code>RenormalizeNaive</code>;softmax 不 renormalize 对应 <code>Default</code>。</li>
+</ul>
+<p>源码见 <code>fused_moe/config.py:100-167</code>。通用 backend 支持检查会同时看 routing method、router logits dtype、hidden dim、activation format、batch invariance、LoRA 等条件,见 <code>fused_moe/modular_kernel.py:536-582</code>。因此“router 被选中”和“某 expert backend 被选中”是两步:router 先定 routing 语义,backend 再决定自己能否吃这种 routing。</p>
+
+<h2>HPC-Ops 题述方案 vs vLLM 源码现状</h2>
+<table>
+<thead><tr><th>维度</th><th>HPC-Ops 题述特征</th><th>vLLM 可确认现状</th><th>证据/边界</th></tr></thead>
+<tbody>
+<tr><td>Router GEMM 精度</td><td>双 BF16 模拟 FP32,面向 MoE router 精度敏感。</td><td><code>GateLinear</code> 支持 DSV3 router GEMM 输出 FP32/BF16,也支持 <code>torch.mm(..., out_dtype=torch.float32)</code>;DSV4 <code>NormGateLinear</code> 的 logits 硬编码 FP32。</td><td><code>router/gate_linear.py:97-117</code>, <code>_custom_ops.py:2355-2397</code>, <code>csrc/moe/dsv4_norm_router_gemm_entry.cu:94-99</code>。未发现双 BF16 拆分/补偿模拟 FP32 的实现。</td></tr>
+<tr><td>Router 与 top-k 是否融合</td><td>题述重点在 Router GEMM,可能与 routing 精度紧密绑定。</td><td>vLLM 通常把 gate GEMM 和 top-k selection 分开。DSV4-Pro 融合的是 RMSNorm+router GEMV,不是 top-k;MegaMoE 模型路径会在 forward 中直接调用 <code>fused_topk_bias()</code>。</td><td><code>router/norm_gate_linear.py:19-36</code>, <code>moe_runner.py:514-537</code>, <code>vllm/models/deepseek_v4/nvidia/model.py:771-789</code>。</td></tr>
+<tr><td>Top-k weights 精度</td><td>MoE router 权重需要稳定。</td><td>vLLM 默认把 <code>topk_weights</code> 作为 FP32 输出,包括 fused top-k、bias top-k、grouped top-k。bias 路径还常要求 correction bias 为 FP32。</td><td><code>fused_topk_router.py:81-83</code>, <code>fused_topk_bias_router.py:261-263</code>, <code>grouped_topk_kernels.cu:1029-1033</code>, <code>fused_topk_bias_router.py:198-204</code>。</td></tr>
+<tr><td>模型级精度保护</td><td>router 精度敏感通常需要模型侧配合。</td><td>vLLM 多个模型显式要求 FP32 logits 或 FP32 gate:DeepSeek V4、GLM4-MoE、Nemotron-H、Gemma4、MiniMax M2。</td><td><code>vllm/models/deepseek_v4/nvidia/model.py:748-763</code>, <code>model_executor/models/glm4_moe.py:146-210</code>, <code>model_executor/models/nemotron_h.py:155-240</code>, <code>model_executor/models/gemma4.py:281-298</code>, <code>model_executor/models/minimax_m2.py:92-135</code>。</td></tr>
+<tr><td>可替换性</td><td>HPC-Ops 可能把 Router GEMM 作为单独优化点。</td><td>vLLM 也把 gate projection 封装成 <code>GateLinear</code>/<code>NormGateLinear</code>,但 router 选择和 expert backend 选择是不同层。替换 Router GEMM 不等于替换 top-k 算法或 expert GEMM backend。</td><td><code>router/gate_linear.py:11-22</code>, <code>router/router_factory.py:63-75</code>, <code>fused_moe/layer.py:318-341</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>关键代码片段</h2>
+<h3>1. runner 只在非 monolithic 路径调用 router</h3>
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/runner/moe_runner.py:514-537
+if self._quant_method.is_monolithic:
+    fused_out = self._quant_method.apply_monolithic(
+        layer=layer,
+        x=hidden_states,
+        router_logits=router_logits,
+        input_ids=input_ids,
+    )
+else:
+    topk_weights, topk_ids = self.router.select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        input_ids=input_ids,
+    )
+
+    fused_out = self._quant_method.apply(
+        layer=layer,
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=self._shared_experts,
+        shared_experts_input=shared_experts_input,
+    )</code></pre>
+
+<h3>2. router 工厂优先级</h3>
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/router/router_factory.py:113-222
+if envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY != "":
+    return RoutingSimulatorRouter(...)
+if zero_expert_type is not None:
+    return ZeroExpertRouter(...)
+if use_grouped_topk:
+    grouped_topk_router = GroupedTopKRouter(...)
+    if grouped_topk_router.routing_method_type != RoutingMethodType.Unspecified \
+            or num_expert_group &gt; 1 or topk_group &gt; 1:
+        return grouped_topk_router
+if custom_routing_function is not None:
+    return CustomRoutingRouter(...)
+if e_score_correction_bias is not None or hash_indices_table is not None:
+    return FusedTopKBiasRouter(...)
+if num_fused_shared_experts &gt; 0 and scoring_func == "softmax" \
+        and rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+    return AiterSharedRoutedFusedMoERouter(...)
+return FusedTopKRouter(...)</code></pre>
+
+<h3>3. grouped top-k 中 bias 只用于选择</h3>
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:124-155
+if e_score_correction_bias is not None:
+    original_scores = scores
+    scores = scores + e_score_correction_bias.unsqueeze(0)
+    group_scores = (
+        scores.view(num_token, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+    )
+else:
+    group_scores = scores.view(num_token, num_expert_group, -1).max(dim=-1).values
+
+...
+if e_score_correction_bias is not None:
+    topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+    topk_weights = original_scores.gather(1, topk_ids)
+else:
+    topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)</code></pre>
+
+<h3>4. DSV4 fused norm + router GEMM 的 FP32 logits</h3>
+<pre><code class="language-python"># vllm/model_executor/layers/fused_moe/router/norm_gate_linear.py:97-114
+def forward(self, x: torch.Tensor) -&gt; tuple[torch.Tensor, torch.Tensor]:
+    if self._fused_kernel_supported:
+        return torch.ops.vllm.dsv4_pro_norm_gate(
+            x, self.norm.weight, self.gate.weight, self.rms_eps
+        )
+
+    normed_x = self.norm(x)
+    logits, _ = self.gate(normed_x)
+    return normed_x, logits</code></pre>
+
+<h2>容易误读的点</h2>
+<table>
+<thead><tr><th>容易误读</th><th>实际情况</th><th>依据</th></tr></thead>
+<tbody>
+<tr><td>只要是 MoE 就会走 <code>GateLinear</code>。</td><td>不一定。很多模型仍用 <code>ReplicatedLinear</code> 或 <code>nn.Linear</code> 计算 router logits;是否使用 <code>GateLinear</code>/<code>NormGateLinear</code> 取决于模型实现。</td><td><code>model_executor/models/kimi_linear.py:128-135</code>, <code>model_executor/models/glm4_moe.py:146-151</code>, <code>model_executor/models/deepseek_v2.py:273-277</code></td></tr>
+<tr><td><code>GroupedTopKRouter</code> 一定执行 grouped top-k。</td><td>如果 runtime 分组无效,它会退到普通 <code>fused_topk</code> 或 <code>fused_topk_bias</code>;如果工厂发现只有一个 trivial group 且 routing type 未指定,甚至不会返回 grouped router。</td><td><code>router_factory.py:162-173</code>, <code>grouped_topk_router.py:306-334</code></td></tr>
+<tr><td>有 correction bias 时,bias 也一定参与最终权重。</td><td>Grouped top-k 和 sqrtsoftplus fallback 都把 bias 用于 expert selection,但最终 routing weights 从未加 bias的 scores 中 gather。softmax/sigmoid fused kernel 的细节在 CUDA op 内,Python 层只负责传入 bias。</td><td><code>grouped_topk_router.py:124-155</code>, <code>fused_topk_bias_router.py:76-103</code></td></tr>
+<tr><td><code>router_logits_dtype=torch.float32</code> 会自动让所有 gate 都用 FP32 计算。</td><td>它主要进入 <code>FusedMoEConfig</code> 给 backend 支持性检查使用。真正 logits 如何计算由模型的 gate layer 决定,例如 <code>GateLinear.out_dtype</code>、<code>nn.Linear(dtype=torch.float32)</code> 或显式 cast。</td><td><code>fused_moe/layer.py:318-341</code>, <code>modular_kernel.py:565-570</code>, <code>router/gate_linear.py:75-91</code></td></tr>
+<tr><td>vLLM 已经实现了 HPC-Ops 双 BF16 模拟 FP32 Router GEMM。</td><td>本地源码没有看到双 BF16 模拟 FP32 的 router GEMM。能确认的是 DSV3/DSV4 router GEMM 支持 BF16 输入和 FP32 logits,以及 cuBLAS <code>out_dtype=torch.float32</code> 路径。</td><td><code>csrc/moe/dsv3_router_gemm_entry.cu:124-127</code>, <code>csrc/moe/dsv4_norm_router_gemm_entry.cu:94-99</code>, <code>router/gate_linear.py:106-109</code></td></tr>
+</tbody>
+</table>
+
+<h2>阅读结论</h2>
+<ul>
+  <li><span class="ok">确认:</span> vLLM 的 router 选择流程集中在 <code>router_factory.py</code>,并在 <code>FusedMoE.__init__</code> 中由模型传入的 grouped/custom/bias/hash/AITER/zero expert 参数决定。</li>
+  <li><span class="ok">确认:</span> 默认 top-k、bias top-k、grouped top-k 都把 <code>topk_weights</code> 作为 FP32 结果处理,这与 MoE router 精度敏感的需求一致。</li>
+  <li><span class="ok">确认:</span> <code>GateLinear</code> 和 <code>NormGateLinear</code> 是当前工作树中 router GEMM 精度优化最直接的代码入口,覆盖 DSV3/DSV4、小 token batch、BF16 输入到 FP32 logits 等路径。</li>
+  <li><span class="warn">边界:</span> vLLM 当前源码体现的是“BF16 输入/权重 + FP32 logits/weights”的若干实现,不是 HPC-Ops 题述“双 BF16 模拟 FP32”算法。若要移植 HPC-Ops Router GEMM,最自然的落点是 <code>GateLinear.forward()</code> 的 specialized/cublas tier,以及 DSV4 的 <code>dsv4_norm_router_gemm</code> 类似入口,而不是 expert GEMM backend oracle。</li>
+</ul>
+
+<p class="meta">Mermaid 图在 MkDocs Material 页面中渲染;若直接打开 HTML 且站点没有全局 Mermaid loader,本文底部也加载 Mermaid CDN 作为兜底。</p>
+
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+mermaid.initialize({startOnLoad:true,theme:"default",securityLevel:"loose"});
+</script>
+</body>
+</html>

@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM Marlin kernel 集成学习笔记</title>
+<style>
+body{font:14px/1.65 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1120px;margin:2rem auto;padding:0 1rem;color:#1b1f24}
+h1,h2{border-bottom:1px solid #e1e4e8;padding-bottom:.3em}
+h2{margin-top:2rem}
+h3{margin-top:1.4rem}
+a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}
+pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;overflow:auto}
+pre code{background:transparent;padding:0}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d7de;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#f6f8fa}
+.lead{color:#57606a;font-size:15px}
+.meta{color:#57606a;font-size:12px}
+.ok{color:#0a7d20;font-weight:600}
+.warn{color:#b35900;font-weight:600}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da}
+.box{border-left:4px solid #0969da;background:#f6f8fa;padding:8px 12px;margin:12px 0}
+nav a{margin-right:1rem}
+</style>
+</head>
+<body>
+<nav><a href="overview.html">&larr; overview</a><a href="index.html">codepath map</a><a href="humming-kernel.html">humming note</a></nav>
+
+<h1>vLLM Marlin kernel 集成学习笔记</h1>
+<p class="lead">结论先行:Marlin 在当前 vLLM 工作树里是一组自带 CUDA GEMM kernel 与 Python 适配层,主要服务量化 Linear GEMM 和 MoE expert GEMM。普通 Linear 最终落到 <code>ops.marlin_gemm</code>; MoE expert 先做 router/top-k,再用 <code>ops.moe_wna16_marlin_gemm</code> 分别执行 <code>w13</code> gate/up GEMM 和 <code>w2</code> down GEMM。</p>
+<p class="meta">源码基准:<code>/Users/f/Documents/vllm-workspace/tasks/opt-kimi-pd/vllm-int</code> 当前工作树。本文只依据本地源码行号;不把 benchmark、测试文件当作推理路径证据。</p>
+
+<h2>一句话定位</h2>
+<table>
+<thead><tr><th>问题</th><th>源码事实</th></tr></thead>
+<tbody>
+<tr><td>Marlin kernel 是什么</td><td>vLLM 自带的量化 GEMM 后端。CUDA 侧实现普通矩阵乘 <code>marlin_gemm</code> 和 MoE 专用 <code>moe_wna16_marlin_gemm</code>; Python 侧把 GPTQ/AWQ/FP8/MXFP8/MXFP4/NVFP4 权重重排成 Marlin 布局后调用这些 op。</td></tr>
+<tr><td>对应实现文件</td><td>核心 CUDA:<code>csrc/quantization/marlin/*</code> 与 <code>csrc/moe/marlin_moe_wna16/*</code>; Python op 封装:<code>vllm/_custom_ops.py</code>; Linear kernel:<code>vllm/model_executor/kernels/linear/**/marlin.py</code>; MoE experts:<code>vllm/model_executor/layers/fused_moe/experts/marlin_moe.py</code>; 量化适配:<code>auto_gptq.py</code>、<code>awq_marlin.py</code>、<code>compressed_tensors_moe_wna16_marlin.py</code>、<code>marlin_utils*.py</code>。</td></tr>
+<tr><td>在推理流程的位置</td><td><span class="tag">Linear GEMM</span> 和 <span class="tag">MoE FFN / expert GEMM</span>。它不属于 attention、KV cache 或 sampling。prefill/decode 都会在执行量化 Linear 或 MoE FFN 时经过对应 Marlin 路径。</td></tr>
+<tr><td>如何启用/选择</td><td>Linear 侧通过 quantization override、<code>--linear-backend marlin</code> 或 auto priority 选择 Marlin kernel 类; MoE 侧通过 GPTQ/AWQ/CompressedTensors WNA16、FP8/MXFP4/NVFP4 oracle 的 <code>--moe-backend marlin</code> 或 auto priority 选择 <code>MarlinExperts</code>/<code>BatchedMarlinExperts</code>。</td></tr>
+</tbody>
+</table>
+
+<div class="box">命名边界:<code>marlin</code> 不是 <code>QuantizationMethods</code> Literal 里的正式量化方法名;正式注册名是 <code>gptq_marlin</code> 和 <code>awq_marlin</code>, 见 <code>vllm/model_executor/layers/quantization/__init__.py:12-47</code>。不过 GPTQ/AWQ override 会接受用户传入 <code>quantization="marlin"</code> 作为触发条件,见 <code>auto_gptq.py:216-236</code> 与 <code>awq_marlin.py:248-269</code>。Kernel backend 的正式选项则包含 <code>--linear-backend marlin</code> 和 <code>--moe-backend marlin</code>,见 <code>vllm/config/kernel.py:122-209</code>。</div>
+
+<h2>源码入口和算子实现</h2>
+<table>
+<thead><tr><th>层次</th><th>文件:行</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td>普通 Marlin CUDA GEMM</td><td><code>csrc/quantization/marlin/marlin.cu:531-542</code>, <code>csrc/quantization/marlin/marlin.cu:861-863</code></td><td><code>marlin_gemm()</code> 接收 A、Marlin packed weight、scale、zero point、g_idx、workspace 等参数,最终注册到 <code>torch.ops._C.marlin_gemm</code>。</td></tr>
+<tr><td>普通 kernel 模板</td><td><code>csrc/quantization/marlin/marlin_template.h:225-270</code></td><td>定义实际 <code>Marlin</code> CUDA kernel 模板,支持 FP16/BF16 或 8-bit activation、量化 weight、scale/global scale/zero-point、act-order 等组合。</td></tr>
+<tr><td>GPTQ repack</td><td><code>csrc/quantization/marlin/gptq_marlin_repack.cu:278-340</code></td><td>校验 16x64 tile 约束,把 GPTQ/FP8/FP4 等 packed weight 重排成 Marlin tile 布局。</td></tr>
+<tr><td>AWQ repack</td><td><code>csrc/quantization/marlin/awq_marlin_repack.cu:221-287</code></td><td>处理 AWQ packing order,输出同样的 Marlin tile 布局。</td></tr>
+<tr><td>INT4+FP8 预处理</td><td><code>csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu:58-105</code></td><td>在 W4A8-FP8 场景预处理 int4 权重/zero point,供后续 Marlin GEMM 使用。</td></tr>
+<tr><td>MoE Marlin CUDA GEMM</td><td><code>csrc/moe/marlin_moe_wna16/ops.cu:535-590</code>, <code>csrc/moe/marlin_moe_wna16/ops.cu:856-873</code></td><td><code>moe_wna16_marlin_gemm()</code> 在 GEMM 参数外额外接收 <code>sorted_token_ids</code>、<code>expert_ids</code>、<code>topk_weights</code>、<code>moe_block_size</code> 等 routing 元数据,最终注册到 <code>torch.ops._moe_C.moe_wna16_marlin_gemm</code>。</td></tr>
+<tr><td>MoE kernel 模板</td><td><code>csrc/moe/marlin_moe_wna16/marlin_template.h:233-283</code></td><td>MoE 版本的 <code>Marlin</code> CUDA kernel,在普通 Marlin GEMM 参数上加入 token/expert/top-k 参数。</td></tr>
+<tr><td>Python custom op 封装</td><td><code>vllm/_custom_ops.py:1159-1318</code>, <code>vllm/_custom_ops.py:2499-2560</code></td><td>把 <code>gptq_marlin_repack</code>、<code>awq_marlin_repack</code>、<code>marlin_int4_fp8_preprocess</code>、<code>marlin_gemm</code>、<code>moe_wna16_marlin_gemm</code> 暴露给 Python 量化层。</td></tr>
+</tbody>
+</table>
+
+<h2>推理流程位置</h2>
+<p>Marlin 不是单一功能开关,而是两个推理阶段会用到的 GEMM 后端。</p>
+<table>
+<thead><tr><th>路径</th><th>运行位置</th><th>prefill/decode 关系</th><th>关键入口</th></tr></thead>
+<tbody>
+<tr><td>量化 Linear</td><td>attention 的 q/k/v/o projection、MLP dense projection、LM head 等所有被量化配置命中的 <code>LinearBase</code>。</td><td>prefill 与 decode 都执行 transformer layer 的 Linear,因此只要对应 layer 的 quant method 选到 Marlin,两个阶段都会走。</td><td><code>AutoGPTQLinearMethod.apply()</code> / <code>AWQMarlinLinearMethod.apply()</code> 调 kernel <code>apply_weights()</code>,见 <code>auto_gptq.py:451-460</code> 与 <code>awq_marlin.py:491-507</code>。</td></tr>
+<tr><td>MoE expert GEMM</td><td>MoE FFN 中 router 选专家之后的 expert computation。先做 <code>w13</code> gate/up GEMM,中间做 activation,再做 <code>w2</code> down GEMM。</td><td>prefill/decode 都会在 MoE layer forward 时使用同一路径;差异主要体现在 token 数 M、routing 分布、CUDA graph/EP 通信,不是 Marlin 调用链的不同。</td><td><code>FusedMoE.forward()</code> 到 <code>MoERunner._apply_quant_method()</code>,再进入 <code>MarlinExperts.apply()</code> 或旧式 <code>fused_marlin_moe()</code>,见 <code>fused_moe/layer.py:1306-1316</code>、<code>runner/moe_runner.py:496-537</code>。</td></tr>
+</tbody>
+</table>
+
+<p>vLLM 的 modular MoE 注释把整个 MoE 分成:</p>
+<pre><code>[Router] -&gt; [Quantize-Dispatch] -&gt; [Permute-Experts-Unpermute] -&gt; [Combine]</code></pre>
+<p>这段分层定义见 <code>vllm/model_executor/layers/fused_moe/modular_kernel.py:46-80</code>。Marlin expert 属于 <code>FusedMoEExpertsModular</code> 的 “matmul + activation + matmul” 部分; prepare/finalize 可以由其它 all2all/dispatch 实现组合。</p>
+
+<h2>Linear 集成路径</h2>
+<h3>1. 注册与 backend 选择</h3>
+<ul>
+  <li><code>QuantizationMethods</code> 包含 <code>"gptq_marlin"</code> 和 <code>"awq_marlin"</code>,见 <code>quantization/__init__.py:12-47</code>。</li>
+  <li><code>get_quantization_config()</code> 把 <code>"gptq_marlin"</code> 映射到 <code>AutoGPTQConfig</code>,把 <code>"awq_marlin"</code> 映射到 <code>AWQMarlinConfig</code>,见 <code>quantization/__init__.py:109-170</code>。</li>
+  <li><code>ModelConfig._verify_quantization()</code> 会按 override 列表探测模型 HF quant config,其中包含 <code>gptq_marlin</code>、<code>awq_marlin</code>、<code>moe_wna16</code> 等,见 <code>vllm/config/model.py:1002-1044</code>; 探测结果会写回 <code>self.quantization</code>,见 <code>vllm/config/model.py:1046-1068</code>。</li>
+  <li><code>--linear-backend marlin</code> 会把 Linear 候选 kernel 过滤到 <code>MarlinFP8ScaledMMLinearKernel</code>、<code>MarlinLinearKernel</code>、<code>MarlinMxfp8LinearKernel</code>、<code>MarlinNvFp4LinearKernel</code>、<code>MarlinMxFp4LinearKernel</code>,见 <code>vllm/model_executor/kernels/linear/__init__.py:176-207</code>。</li>
+</ul>
+
+<h3>2. GPTQ / AWQ WNA16 Linear</h3>
+<p>GPTQ 与 AWQ 都先构造 <code>MPLinearLayerConfig</code>,再通过 <code>choose_mp_linear_kernel()</code> 选择混合精度 kernel。CUDA 平台的 auto priority 中,Marlin 排在 Cutlass W4A8、Machete、AllSpark 之后,Conch/Exllama 之前,见 <code>vllm/model_executor/kernels/linear/__init__.py:331-339</code>。</p>
+<ul>
+  <li><code>AutoGPTQLinearMethod.create_weights()</code> 构造 weight/scales/qzeros/g_idx 参数并调用 <code>choose_mp_linear_kernel()</code>,见 <code>auto_gptq.py:322-350</code>。</li>
+  <li><code>AWQMarlinLinearMethod.create_weights()</code> 同样构造 <code>MPLinearLayerConfig</code> 并选择 kernel,见 <code>awq_marlin.py:402-489</code>。</li>
+  <li><code>MarlinLinearKernel.can_implement()</code> 要求 CUDA、支持的 weight type、group size 与 shape,见 <code>kernels/linear/mixed_precision/marlin.py:30-62</code>。</li>
+  <li><code>MarlinLinearKernel.process_weights_after_loading()</code> 分配 workspace、处理 act-order、调用 <code>ops.gptq_marlin_repack()</code>、重排 scales/zero-points/bias,见 <code>kernels/linear/mixed_precision/marlin.py:67-171</code>。</li>
+  <li><code>MarlinLinearKernel.apply_weights()</code> 调 <code>apply_gptq_marlin_linear()</code>,见 <code>kernels/linear/mixed_precision/marlin.py:173-200</code>。</li>
+  <li><code>apply_gptq_marlin_linear()</code> 可能先对 activation 做 INT8/FP8 per-token quant,最后调用 <code>ops.marlin_gemm()</code>,见 <code>quantization/utils/marlin_utils.py:510-574</code>。</li>
+</ul>
+
+<h3>3. FP8 / MXFP8 / MXFP4 / NVFP4 Linear</h3>
+<table>
+<thead><tr><th>Linear kernel 类</th><th>支持/用途</th><th>权重后处理</th><th>forward 调用</th></tr></thead>
+<tbody>
+<tr><td><code>MarlinFP8ScaledMMLinearKernel</code></td><td>注释写明用于缺少 FP8 硬件支持的 GPU 上做 weight-only FP8,见 <code>kernels/linear/scaled_mm/marlin.py:29-56</code>。</td><td><code>prepare_fp8_layer_for_marlin()</code>,见 <code>kernels/linear/scaled_mm/marlin.py:70-102</code>。</td><td><code>apply_fp8_marlin_linear()</code> -&gt; <code>ops.marlin_gemm()</code>,见 <code>kernels/linear/scaled_mm/marlin.py:104-123</code> 与 <code>marlin_utils_fp8.py:42-89</code>。</td></tr>
+<tr><td><code>MarlinMxfp8LinearKernel</code></td><td>MXFP8 W8A16 GEMM via Marlin,见 <code>kernels/linear/mxfp8/marlin.py:9-22</code>。</td><td><code>prepare_mxfp8_layer_for_marlin()</code>,见 <code>kernels/linear/mxfp8/marlin.py:28-33</code> 与 <code>marlin_utils_fp8.py:393-449</code>。</td><td><code>apply_mxfp8_marlin_linear()</code> -&gt; <code>ops.marlin_gemm()</code>,见 <code>kernels/linear/mxfp8/marlin.py:35-53</code> 与 <code>marlin_utils_fp8.py:349-390</code>。</td></tr>
+<tr><td><code>MarlinMxFp4LinearKernel</code></td><td>MXFP4 Linear Marlin fallback/候选,见 <code>kernels/linear/mxfp4/marlin.py:9-24</code>。</td><td><code>prepare_fp4_layer_for_marlin()</code>,见 <code>kernels/linear/mxfp4/marlin.py:26-31</code> 与 <code>marlin_utils_fp4.py:205-285</code>。</td><td><code>apply_fp4_marlin_linear()</code> -&gt; <code>ops.marlin_gemm()</code>,见 <code>kernels/linear/mxfp4/marlin.py:33-52</code> 与 <code>marlin_utils_fp4.py:149-202</code>。</td></tr>
+<tr><td><code>MarlinNvFp4LinearKernel</code></td><td>NVFP4 weight-only W4A16 GEMM via Marlin,源码 warning 明确说 GPU 没有 native FP4 compute 时使用 weight-only FP4 compression,见 <code>kernels/linear/nvfp4/marlin.py:18-40</code>。</td><td><code>prepare_fp4_layer_for_marlin()</code> 会额外处理 NVFP4 global scale,见 <code>marlin_utils_fp4.py:260-273</code>。</td><td><code>apply_fp4_marlin_linear()</code> -&gt; <code>ops.marlin_gemm()</code>,见 <code>kernels/linear/nvfp4/marlin.py:42-57</code>。</td></tr>
+</tbody>
+</table>
+<p>auto priority 方面:FP8 per-tensor CUDA 列表把 <code>MarlinFP8ScaledMMLinearKernel</code> 放第一,见 <code>kernels/linear/__init__.py:266-273</code>; FP8 block CUDA 列表中 Marlin 排在 FlashInfer/DeepGEMM/Cutlass 后、Triton 前,见 <code>kernels/linear/__init__.py:292-302</code>; MXFP8 CUDA 列表中 Marlin 排在 FlashInfer CUTLASS 后、emulation 前,见 <code>kernels/linear/__init__.py:356-360</code>; NVFP4 CUDA 列表中 Marlin 排在 FlashInfer CUTLASS 与 CUTLASS 后,见 <code>kernels/linear/__init__.py:371-383</code>; MXFP4 CUDA 列表为 FlashInfer 再 Marlin,见 <code>kernels/linear/__init__.py:389-393</code>。</p>
+
+<h2>MoE 集成路径</h2>
+<h3>1. FusedMoE 到 MarlinExperts</h3>
+<p>MoE layer 构造时会保存 <code>kernel_config.moe_backend</code>,再通过量化配置拿到 quant method:</p>
+<ul>
+  <li><code>FusedMoE.__init__</code> 构造 <code>FusedMoEConfig</code> 并记录 <code>moe_backend=vllm_config.kernel_config.moe_backend</code>,见 <code>fused_moe/layer.py:318-341</code>。</li>
+  <li>同一个构造流程调用 <code>quant_config.get_quant_method(self, prefix)</code>,如果没有 quant method 就回落到 <code>UnquantizedFusedMoEMethod</code>,见 <code>fused_moe/layer.py:351-369</code>。</li>
+  <li>权重加载结束后,模型加载器遍历模块并调用每个 quant method 的 <code>process_weights_after_loading()</code>,见 <code>model_loader/utils.py:99-112</code>。</li>
+  <li><code>FusedMoE.forward()</code> 进入 runner,见 <code>fused_moe/layer.py:1306-1316</code>。</li>
+  <li><code>MoERunner.forward()</code> 通过 custom op 入口回到 <code>_forward_impl()</code>,见 <code>runner/moe_runner.py:592-642</code> 与 <code>runner/moe_runner.py:90-105</code>。</li>
+  <li><code>_forward_impl()</code> 确保 quant config 初始化、可选 gate、dispatch,再调用 <code>_apply_quant_method()</code>,见 <code>runner/moe_runner.py:742-799</code>。</li>
+  <li><code>_apply_quant_method()</code> 对非 monolithic 路径先 <code>router.select_experts()</code>,拿到 <code>topk_weights</code>/<code>topk_ids</code>,再调用 quant method 的 <code>apply()</code>,见 <code>runner/moe_runner.py:496-537</code>。</li>
+</ul>
+
+<h3>2. Marlin MoE expert 具体做什么</h3>
+<p><code>vllm/model_executor/layers/fused_moe/experts/marlin_moe.py</code> 是 MoE Marlin 的核心 Python 适配。它有两种入口:</p>
+<table>
+<thead><tr><th>入口</th><th>activation format</th><th>来源</th><th>最终 GEMM</th></tr></thead>
+<tbody>
+<tr><td><code>MarlinExperts</code></td><td><code>Standard</code></td><td>普通 token/top-k 格式。<code>MarlinExperts.apply()</code> 调 <code>fused_marlin_moe()</code>,见 <code>marlin_moe.py:693-797</code>。</td><td>两次 <code>ops.moe_wna16_marlin_gemm()</code>。</td></tr>
+<tr><td><code>BatchedMarlinExperts</code></td><td><code>BatchedExperts</code></td><td>expert-parallel/dispatch 后已经按专家 batch 化的格式。<code>batched_fused_marlin_moe()</code> 注释说明把 <code>[B, MAX_TOKENS, K]</code> 视作 2D contiguous tensor,见 <code>marlin_moe.py:390-446</code>。</td><td>仍然通过 <code>_fused_marlin_moe()</code> 和 <code>ops.moe_wna16_marlin_gemm()</code>。</td></tr>
+</tbody>
+</table>
+<p><code>_fused_marlin_moe()</code> 的关键执行顺序:</p>
+<ol>
+  <li>计算 <code>M,K,N</code>,准备 workspace 和两个 intermediate cache,见 <code>marlin_moe.py:96-124</code>。</li>
+  <li>如配置了 <code>VLLM_MARLIN_INPUT_DTYPE</code>,对 hidden states 做 INT8/FP8 activation quant,见 <code>marlin_moe.py:125-133</code>。</li>
+  <li>第一次 <code>ops.moe_wna16_marlin_gemm()</code> 计算 <code>w13</code> gate/up projection,见 <code>marlin_moe.py:134-161</code>。</li>
+  <li>调用 <code>apply_moe_activation()</code> 或传入的 activation callback,见 <code>marlin_moe.py:162-173</code>。</li>
+  <li>可选对 activation 后的 intermediate 再量化,见 <code>marlin_moe.py:181-191</code>。</li>
+  <li>第二次 <code>ops.moe_wna16_marlin_gemm()</code> 计算 <code>w2</code> down projection,并根据 <code>apply_router_weight_on_input</code> 决定 top-k 权重乘法位置,见 <code>marlin_moe.py:193-220</code>。</li>
+  <li><code>fused_marlin_moe()</code> 把输出 view 成 <code>[M, topk, K]</code>,最后 <code>torch.sum(..., dim=1)</code> 或自定义 <code>moe_sum</code> 合并 top-k,见 <code>marlin_moe.py:342-387</code>。</li>
+</ol>
+
+<h3>3. WNA16 MoE: GPTQ / AWQ / CompressedTensors</h3>
+<p>WNA16 这里指 weight-only int4/int8 + 16-bit activation 的 MoE expert GEMM。GPTQ/AWQ 的集成从 quant method 到 modular kernel 已经迁移到 oracle:</p>
+<ul>
+  <li><code>AutoGPTQConfig.get_quant_method()</code> 对 <code>RoutedExperts</code> 返回 <code>AutoGPTQMoEMethod</code>,前提是 <code>check_moe_marlin_supports_layer()</code> 通过,见 <code>auto_gptq.py:238-258</code>。</li>
+  <li><code>AWQMarlinConfig.get_quant_method()</code> 对 <code>RoutedExperts</code> 返回 <code>AWQMarlinMoEMethod</code>,不支持则回落到 <code>MoeWNA16Config</code>,见 <code>awq_marlin.py:280-324</code>。</li>
+  <li><code>AutoGPTQMoEMethod</code> 与 <code>AWQMarlinMoEMethod</code> 都在 <code>__init__</code> 里调用 <code>select_wna16_moe_backend()</code>,见 <code>auto_gptq.py:463-487</code> 与 <code>awq_marlin.py:510-525</code>。</li>
+  <li><code>select_wna16_moe_backend()</code> 的候选只有 <code>MARLIN</code> 和 <code>BATCHED_MARLIN</code>,并通过 <code>is_supported_config()</code> 按 activation format 选择,见 <code>fused_moe/oracle/int_wna16.py:37-145</code>。</li>
+  <li><code>make_wna16_moe_kernel()</code> 用 <code>maybe_make_prepare_finalize()</code> 创建 dispatch/finalize,再实例化 <code>MarlinExperts</code> 或 <code>BatchedMarlinExperts</code>,最后返回 <code>FusedMoEKernel</code>,见 <code>fused_moe/oracle/int_wna16.py:148-206</code>。</li>
+</ul>
+<p>权重转换同样在 oracle 中集中完成:</p>
+<ul>
+  <li><code>convert_to_wna16_moe_kernel_format()</code> 根据 backend 分发到 GPTQ 或 AWQ Marlin 后处理,见 <code>fused_moe/oracle/int_wna16.py:528-620</code>。</li>
+  <li>GPTQ 路径排序/清空 <code>g_idx</code>,调用 <code>ops.gptq_marlin_moe_repack()</code> 处理 <code>w13</code>/<code>w2</code>,并重排 scales/bias,见 <code>fused_moe/oracle/int_wna16.py:214-382</code>。</li>
+  <li>AWQ 路径调用 <code>ops.awq_marlin_moe_repack()</code>,并用 <code>moe_awq_to_marlin_zero_points()</code> 转换 zero point,见 <code>fused_moe/oracle/int_wna16.py:385-525</code>。</li>
+</ul>
+<p>CompressedTensors 的 WNA16 MoE 也优先使用 Marlin:</p>
+<ul>
+  <li>如果 <code>check_moe_marlin_supports_layer()</code> 通过且不是 ROCm,返回 <code>CompressedTensorsWNA16MarlinMoEMethod</code>,见 <code>compressed_tensors_moe.py:96-125</code>。</li>
+  <li>该方法创建 Marlin 布局的 <code>w13_weight_packed</code>/<code>w2_weight_packed</code> 与 scale/g_idx 参数,见 <code>compressed_tensors_moe_wna16_marlin.py:161-323</code>。</li>
+  <li>加载后处理调用 <code>ops.gptq_marlin_moe_repack()</code>、<code>marlin_moe_permute_scales()</code> 并创建 workspace,见 <code>compressed_tensors_moe_wna16_marlin.py:324-459</code>。</li>
+  <li>标准 modular 路径通过 <code>select_gemm_impl()</code> 返回 <code>MarlinExperts</code>/<code>BatchedMarlinExperts</code>,见 <code>compressed_tensors_moe_wna16_marlin.py:474-510</code>; 旧式 apply 路径直接调用 <code>fused_marlin_moe()</code>,见 <code>compressed_tensors_moe_wna16_marlin.py:542-577</code>。</li>
+</ul>
+
+<h3>4. FP8 / MXFP4 / NVFP4 MoE oracle</h3>
+<table>
+<thead><tr><th>量化族</th><th>Marlin backend 映射</th><th>权重转换</th><th>auto priority 中的位置</th></tr></thead>
+<tbody>
+<tr><td>FP8 MoE</td><td><code>map_fp8_backend("marlin") -&gt; Fp8MoeBackend.MARLIN</code>,见 <code>fused_moe/oracle/fp8.py:204-220</code>; <code>backend_to_kernel_cls(MARLIN)</code> 返回 <code>MarlinExperts</code>,见 <code>fused_moe/oracle/fp8.py:111-149</code>。</td><td><code>prepare_fp8_moe_layer_for_marlin()</code>; 若 <code>weight_block_size == [1, 32]</code> 则用 <code>prepare_mxfp8_moe_layer_for_marlin()</code>,见 <code>fused_moe/oracle/fp8.py:430-465</code>。</td><td>FP8 priority 中 Marlin 在 AITER/FlashInfer/DeepGEMM/CUTLASS/Triton 后、batched variants 前,见 <code>fused_moe/oracle/fp8.py:58-82</code>。</td></tr>
+<tr><td>MXFP4 MoE</td><td><code>map_mxfp4_backend("marlin") -&gt; [MARLIN]</code>,见 <code>fused_moe/oracle/mxfp4.py:229-267</code>; activation format 为 batched 时显式 <code>MARLIN</code> 会换成 <code>BATCHED_MARLIN</code>,见 <code>fused_moe/oracle/mxfp4.py:421-435</code>。</td><td><code>prepare_moe_mxfp4_layer_for_marlin()</code>,见 GPT-OSS 路径 <code>fused_moe/oracle/mxfp4.py:732-760</code> 和普通 MXFP4 路径 <code>fused_moe/oracle/mxfp4.py:1250-1296</code>。</td><td>GPT-OSS priority 中 Marlin/Batched Marlin 在 FlashInfer/AITER/Triton/CUTLASS 后,XPU 前,见 <code>fused_moe/oracle/mxfp4.py:270-289</code>; 通用 MXFP4 priority 中在 FlashInfer TRTLLM 与 DeepGEMM 后,见 <code>fused_moe/oracle/mxfp4.py:292-311</code>。</td></tr>
+<tr><td>NVFP4 MoE</td><td><code>map_nvfp4_backend("marlin") -&gt; NvFp4MoeBackend.MARLIN</code>,见 <code>fused_moe/oracle/nvfp4.py:141-157</code>; <code>backend_to_kernel_cls(MARLIN)</code> 返回 <code>MarlinExperts</code>,见 <code>fused_moe/oracle/nvfp4.py:75-130</code>。</td><td><code>prepare_nvfp4_moe_layer_for_marlin()</code>,见 <code>fused_moe/oracle/nvfp4.py:405-424</code> 与 <code>marlin_utils_fp4.py:288-394</code>。</td><td>priority 由 <code>select_nvfp4_moe_backend()</code> 内部选择;显式 <code>--moe-backend marlin</code> 走 map 分支,源码片段见 <code>fused_moe/oracle/nvfp4.py:160-165</code>。</td></tr>
+</tbody>
+</table>
+
+<h2>限制、shape 和环境变量</h2>
+<table>
+<thead><tr><th>项</th><th>源码依据</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>最小 CUDA capability</td><td><code>kernels/linear/mixed_precision/marlin.py:30-39</code>, <code>marlin_utils.py:53-62</code>, <code>marlin_moe.py:598-602</code>, <code>csrc/quantization/marlin/marlin.cu:389-400</code></td><td>普通 Marlin Linear 要 CUDA 且 min capability 7.5; MoE Marlin experts 也要求 CUDA capability 至少 7.5。C++ 侧也检查 Turing 或更新 GPU。</td></tr>
+<tr><td>支持的 weight 类型</td><td><code>marlin_utils.py:39-83</code>, <code>marlin_moe.py:608-624</code></td><td>无 zero point 的 GPTQ 风格支持 <code>uint4b8</code>、<code>uint8b128</code> 以及 FP8/FP4 类型; 有 zero point 的 AWQ 风格支持 <code>uint4</code>。MoE experts 还声明支持 FP8、MXFP4、MXFP8、NVFP4、Int4、Int8 quant key。</td></tr>
+<tr><td>group size</td><td><code>marlin_utils.py:31</code>, <code>marlin_utils.py:137-143</code></td><td>普通 Marlin 支持 <code>-1, 32, 64, 128</code>; FP4 工具里 NVFP4/MXFP4 有专门 group size 处理,见 <code>marlin_utils_fp4.py:21</code> 与 <code>marlin_utils_fp4.py:215-216</code>。</td></tr>
+<tr><td>Linear shape</td><td><code>marlin_utils.py:167-214</code></td><td>Linear 输出分片要能被 <code>min_thread_n=64</code> 整除,输入分片要能被 <code>min_thread_k=128</code> 整除; group 分片也需对齐。</td></tr>
+<tr><td>MoE shape</td><td><code>marlin_utils.py:233-249</code></td><td>MoE Marlin 不支持 <code>apply_router_weight_on_input</code>; 要求 hidden size 是 128 的倍数,intermediate size 分片能被 <code>max(64, group_size)</code> 整除,group size 在 <code>-1,32,64,128</code>。</td></tr>
+<tr><td>activation dtype env</td><td><code>envs.py:1343-1346</code>, <code>marlin_utils.py:478-497</code></td><td><code>VLLM_MARLIN_INPUT_DTYPE</code> 可为 <code>int8</code> 或 <code>fp8</code>。FP8 activation 仅允许 SM89 或 SM12x family;不满足会抛错。</td></tr>
+<tr><td>atomic add reduce env</td><td><code>envs.py:1330-1333</code>, <code>marlin_utils.py:420-465</code></td><td><code>VLLM_MARLIN_USE_ATOMIC_ADD=1</code> 才可能在小 N、大 K 场景启用 atomicAdd reduce;默认关闭并会提示。</td></tr>
+<tr><td>弃用 env</td><td><code>envs.py:1334-1341</code>, <code>envs.py:1676-1704</code></td><td><code>VLLM_MXFP4_USE_MARLIN</code> 与 <code>VLLM_NVFP4_GEMM_BACKEND</code> 已提示改用 <code>--moe-backend marlin</code> 或 <code>--linear-backend marlin</code>。</td></tr>
+<tr><td>batch invariant</td><td><code>awq_marlin.py:249-256</code>, <code>scaled_mm/marlin.py:44-55</code></td><td>AWQ Marlin override 在 <code>VLLM_BATCH_INVARIANT</code> 下跳过; FP8 Marlin 也声明不支持 batch invariant execution。</td></tr>
+</tbody>
+</table>
+
+<h2>与其它 kernel 的关系</h2>
+<p>Marlin 在 vLLM 中不是独立模型流程,而是多个 quantization family 下的 backend 候选。它与 Cutlass、FlashInfer、DeepGEMM、Triton、Machete、Conch、Exllama、AITER 等通过同一套 selector/oracle 竞争。</p>
+<ul>
+  <li>Linear WNA16: <code>choose_mp_linear_kernel()</code> 按平台 priority 和 <code>--linear-backend</code> 过滤选择,见 <code>kernels/linear/__init__.py:611-681</code>。</li>
+  <li>Scaled MM/FP8: <code>choose_scaled_mm_linear_kernel()</code> 负责按 possible kernels、force kernel 和 <code>--linear-backend</code> 过滤,见 <code>kernels/linear/__init__.py:430-499</code>。</li>
+  <li>MXFP4/NVFP4 Linear: <code>init_mxfp4_linear_kernel()</code> 与 <code>init_nvfp4_linear_kernel()</code> 负责处理 auto、显式 backend 和 deprecated env,见 <code>kernels/linear/__init__.py:730-781</code> 与 <code>kernels/linear/__init__.py:831-946</code>。</li>
+  <li>MoE: 各 quantization oracle 把 <code>--moe-backend marlin</code> 映射到 enum,再映射到 <code>MarlinExperts</code>/<code>BatchedMarlinExperts</code>。FP8/MXFP4/NVFP4 的 mapping 分别见 <code>oracle/fp8.py:204-220</code>、<code>oracle/mxfp4.py:229-267</code>、<code>oracle/nvfp4.py:141-157</code>。</li>
+  <li>Modular MoE: <code>FusedMoEKernel</code> 要求 prepare/finalize 与 experts 都是 modular 或都 monolithic,并在 <code>apply()</code> 中串起 prepare、experts、finalize,见 <code>modular_kernel.py:1507-1543</code> 与 <code>modular_kernel.py:1633-1660</code>。</li>
+</ul>
+
+<h2>最小调用链图</h2>
+<h3>Linear</h3>
+<pre><code>ModelConfig._verify_quantization()
+  -&gt; AutoGPTQConfig / AWQMarlinConfig override
+     quantization/__init__.py:109-170
+     config/model.py:1002-1068
+  -&gt; LinearBase creates quant method
+     auto_gptq.py:238-266
+     awq_marlin.py:280-304
+  -&gt; choose_mp_linear_kernel() or init_*_linear_kernel()
+     kernels/linear/__init__.py:430-681, 730-946
+  -&gt; process_weights_after_loading()
+     model_loader/utils.py:99-112
+  -&gt; Marlin repack / scale permute / workspace
+     mixed_precision/marlin.py:67-171
+     marlin_utils_fp8.py:92-199, 393-449
+     marlin_utils_fp4.py:205-285
+  -&gt; apply_weights()
+  -&gt; apply_*_marlin_linear()
+  -&gt; ops.marlin_gemm()
+  -&gt; csrc/quantization/marlin/marlin.cu</code></pre>
+
+<h3>MoE</h3>
+<pre><code>Transformer layer MoE FFN
+  -&gt; FusedMoE.forward()
+     fused_moe/layer.py:1306-1316
+  -&gt; MoERunner.forward() / _forward_impl()
+     runner/moe_runner.py:592-642, 742-799
+  -&gt; router.select_experts() -> topk_weights, topk_ids
+     runner/moe_runner.py:522-526
+  -&gt; quant_method.apply()
+     auto_gptq.py:772-795
+     awq_marlin.py:740-763
+  -&gt; FusedMoEKernel.apply()
+     modular_kernel.py:1633-1660
+  -&gt; MarlinExperts.apply() / BatchedMarlinExperts.apply()
+     fused_moe/experts/marlin_moe.py:693-797, 903-1008
+  -&gt; fused_marlin_moe()
+     fused_moe/experts/marlin_moe.py:225-387
+  -&gt; ops.moe_wna16_marlin_gemm() for w13
+  -&gt; apply_moe_activation()
+  -&gt; ops.moe_wna16_marlin_gemm() for w2
+  -&gt; top-k reduce/combine
+  -&gt; csrc/moe/marlin_moe_wna16/ops.cu</code></pre>
+
+<h2>阅读结论</h2>
+<ul>
+  <li><span class="ok">确认:</span> Marlin 在 vLLM 里是自带 CUDA op + Python selector/quant method 适配,不是只依赖外部包。</li>
+  <li><span class="ok">确认:</span> 普通量化 Linear 的最终核心 op 是 <code>ops.marlin_gemm</code>; MoE expert 的最终核心 op 是 <code>ops.moe_wna16_marlin_gemm</code>。</li>
+  <li><span class="ok">确认:</span> 它在模型推理中位于 GEMM 环节:attention/MLP/LM head 的量化 Linear GEMM,以及 MoE FFN 的 routed expert GEMM。prefill 和 decode 都可能经过它。</li>
+  <li><span class="ok">确认:</span> 集成机制包括 quantization override、linear backend selector、MoE backend oracle、post-load 权重重排、modular MoE prepare/finalize 组合。</li>
+  <li><span class="warn">注意:</span> <code>--quantization marlin</code> 在源码中表现为 GPTQ/AWQ override 可接受的别名触发条件,不是 <code>QuantizationMethods</code> 的正式注册名;文档和实验记录应写清最终解析后的 <code>self.quantization</code>。</li>
+</ul>
+</body>
+</html>
